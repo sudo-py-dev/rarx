@@ -1,0 +1,18 @@
+[package]
+name = "rarx-sfx"
+description = "RarX self-extracting archive stubs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rarx-sfx"
+path = "src/main.rs"
+
+[dependencies]
+
+
+[lints]
+workspace = true

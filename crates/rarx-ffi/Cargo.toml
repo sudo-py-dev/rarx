@@ -1,0 +1,17 @@
+[package]
+name = "rarx-ffi"
+description = "Stable C ABI for the RarX engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+rarx-core.workspace = true
+
+[lints]
+workspace = true

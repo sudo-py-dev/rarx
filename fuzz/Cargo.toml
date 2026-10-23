@@ -1,0 +1,38 @@
+[package]
+name = "rarx-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rarx-io = { path = "../crates/rarx-io" }
+rarx-formats = { path = "../crates/rarx-formats" }
+rarx-filters = { path = "../crates/rarx-filters" }
+
+# Not part of the main workspace: fuzzing needs a nightly toolchain.
+[workspace]
+
+[[bin]]
+name = "detect"
+path = "fuzz_targets/detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_varints"
+path = "fuzz_targets/cursor_varints.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delta_roundtrip"
+path = "fuzz_targets/delta_roundtrip.rs"
+test = false
+doc = false
+bench = false

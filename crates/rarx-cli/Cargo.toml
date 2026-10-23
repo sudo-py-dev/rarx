@@ -1,0 +1,22 @@
+[package]
+name = "rarx-cli"
+description = "RarX command-line front-ends (rarx, rx7)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rarx-core.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rarx"
+path = "src/bin/rarx.rs"
+
+[[bin]]
+name = "rx7"
+path = "src/bin/rx7.rs"
