@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 rarx-core.workspace = true
 
+[dev-dependencies]
+rarx-testkit.workspace = true
+
 [lints]
 workspace = true
 

@@ -7,28 +7,19 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod archive;
 mod error;
+mod extract;
 mod job;
+pub mod sanitize;
+pub mod select;
+pub mod time;
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-
+pub use archive::{Archive, detect_file};
 pub use error::{Error, Result};
+pub use extract::{
+    ExtractHandler, ExtractOptions, ItemError, Outcome, OverwriteChoice, OverwriteMode, PathMode,
+    Report, SilentHandler, extract, test,
+};
 pub use job::JobControl;
-pub use rarx_formats::FormatId;
-
-/// Bytes read from the start of a file for signature detection.
-const DETECT_PREFIX_LEN: u64 = 64;
-
-/// Identifies the archive format of the file at `path` by its signature.
-///
-/// # Errors
-/// Returns [`Error::Io`] if the file cannot be opened or read.
-pub fn detect_file(path: &Path) -> Result<Option<FormatId>> {
-    let mut prefix = Vec::new();
-    File::open(path)?
-        .take(DETECT_PREFIX_LEN)
-        .read_to_end(&mut prefix)?;
-    Ok(rarx_formats::detect(&prefix))
-}
+pub use rarx_formats::{DataError, Entry, EntryKind, FileTime, FormatError, FormatId};

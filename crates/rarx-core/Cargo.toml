@@ -9,6 +9,10 @@ publish.workspace = true
 
 [dependencies]
 rarx-formats.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+rarx-testkit.workspace = true
 
 [lints]
 workspace = true

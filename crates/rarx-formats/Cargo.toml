@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 rarx-io.workspace = true
+rarx-checksum.workspace = true
+flate2.workspace = true
 
 [lints]
 workspace = true
