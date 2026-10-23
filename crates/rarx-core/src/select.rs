@@ -37,6 +37,12 @@ impl Selection {
         self
     }
 
+    /// The exclude masks, normalised.
+    #[must_use]
+    pub fn exclusions(&self) -> &[String] {
+        &self.exclude
+    }
+
     /// Whether any include masks were given.
     #[must_use]
     pub fn has_includes(&self) -> bool {

@@ -16,6 +16,8 @@ pub enum Error {
     Format(FormatError),
     /// The file is not an archive in any format RarX recognises.
     UnknownFormat(PathBuf),
+    /// The operation needs a feature RarX does not implement yet.
+    Unsupported(String),
     /// The user or caller cancelled the job.
     Cancelled,
 }
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             Self::UnknownFormat(path) => {
                 write!(f, "cannot open the file as an archive: {}", path.display())
             }
+            Self::Unsupported(what) => write!(f, "not supported yet: {what}"),
             Self::Cancelled => f.write_str("operation cancelled"),
         }
     }
@@ -38,7 +41,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(err) => Some(err),
             Self::Format(err) => Some(err),
-            Self::UnknownFormat(_) | Self::Cancelled => None,
+            Self::UnknownFormat(_) | Self::Unsupported(_) | Self::Cancelled => None,
         }
     }
 }

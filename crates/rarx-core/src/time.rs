@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use jiff::Timestamp;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
-use rarx_formats::FileTime;
+use rarx_formats::{CivilTime, FileTime};
 
 fn to_timestamp(time: FileTime) -> Option<Timestamp> {
     match time {
@@ -34,10 +34,35 @@ pub fn format_local(time: FileTime, pattern: &str) -> Option<String> {
     Some(zoned.strftime(pattern).to_string())
 }
 
+/// Converts a file-system time to an absolute archive timestamp.
+#[must_use]
+pub fn from_system_time(time: SystemTime) -> Option<FileTime> {
+    let ts = Timestamp::try_from(time).ok()?;
+    Some(FileTime::Unix {
+        seconds: ts.as_second(),
+        nanos: u32::try_from(ts.subsec_nanosecond()).ok()?,
+    })
+}
+
+/// Local wall-clock fields of a file-system time, for formats that store local time.
+#[must_use]
+pub fn to_local_civil(time: SystemTime) -> Option<CivilTime> {
+    let dt = Timestamp::try_from(time)
+        .ok()?
+        .to_zoned(TimeZone::system())
+        .datetime();
+    Some(CivilTime {
+        year: dt.year(),
+        month: dt.month(),
+        day: dt.day(),
+        hour: dt.hour(),
+        minute: dt.minute(),
+        second: dt.second(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use rarx_formats::CivilTime;
-
     use super::*;
 
     #[test]
@@ -63,5 +88,22 @@ mod tests {
         };
         let text = format_local(FileTime::Local(civil), "%Y-%m-%d %H:%M:%S").unwrap();
         assert_eq!(text, "2026-10-23 10:47:42");
+    }
+
+    #[test]
+    fn system_time_conversions_agree() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_767_323_045, 7);
+        assert_eq!(
+            from_system_time(now),
+            Some(FileTime::Unix {
+                seconds: 1_767_323_045,
+                nanos: 7
+            })
+        );
+        let civil = to_local_civil(now).unwrap();
+        assert_eq!(
+            to_system_time(FileTime::Local(civil)),
+            Some(now - std::time::Duration::new(0, 7))
+        );
     }
 }

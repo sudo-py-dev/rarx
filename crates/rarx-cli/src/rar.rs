@@ -6,8 +6,9 @@ use std::process::ExitCode;
 
 use rarx_core::select::Selection;
 use rarx_core::{
-    Archive, Entry, EntryKind, Error, ExtractHandler, ExtractOptions, ItemError, JobControl,
-    Outcome, OverwriteChoice, OverwriteMode, PathMode, Report, extract, test,
+    AddOptions, Archive, Entry, EntryKind, Error, ExtractHandler, ExtractOptions, ItemAction,
+    ItemError, JobControl, Outcome, OverwriteChoice, OverwriteMode, PathMode, Report, StorePaths,
+    UpdateHandler, UpdateMode, add, delete, extract, test,
 };
 
 use crate::common::{
@@ -21,21 +22,31 @@ Usage:     rarx <command> -<switch 1> -<switch N> <archive> <files...>
                <@listfiles...> <path_to_extract/>
 
 <Commands>
+  a             Add files to archive (only .zip archives can be created yet)
+  d             Delete files from archive
   e             Extract files without archived paths
+  f             Freshen files in archive
   l[t[a],b]     List archive contents [technical[all], bare]
+  m[f]          Move to archive [files only]
   p             Print file to stdout
   t             Test archive files
+  u             Update files in archive
   v[t[a],b]     Verbosely list archive contents [technical[all], bare]
   x             Extract files with full path
 
 <Switches>
   -             Stop switches scanning
+  df            Delete files after archiving
   ep            Exclude paths from names
+  ep1           Exclude base directory from names
+  ep2           Expand paths to full
   idq           Disable messages, except errors
   inul          Disable all messages
   kb            Keep broken extracted files
+  m<0..5>       Set compression level (0-store...3-default...5-maximal)
   n<file>       Additionally filter included files
   o[+|-]        Set the overwrite mode
+  ol            Save symbolic links as the link instead of the file
   op<path>      Set the output path for extracted files
   or            Rename files automatically
   r             Recurse subdirectories (accepted; masks always match at any depth)
@@ -54,6 +65,13 @@ struct Options {
     quiet: bool,
     silent: bool,
     selection: Selection,
+    excludes: Selection,
+    level: u32,
+    paths: StorePaths,
+    store_symlinks: bool,
+    delete_sources: bool,
+    /// Arguments after the archive name: files to add, or masks to extract.
+    files: Vec<String>,
 }
 
 /// Runs the `rarx` command line.
@@ -92,8 +110,12 @@ pub fn run(args: &[String]) -> ExitCode {
         }
         "x" | "e" => open(path).map(|mut a| run_extract(&mut a, &options, PathMode::None)),
         "p" => open(path).map(|mut a| print_files(&mut a, &options)),
-        "a" | "c" | "ch" | "cw" | "d" | "f" | "i" | "k" | "m" | "mf" | "r" | "rc" | "rn" | "rr"
-        | "rv" | "s" | "u" => {
+        "a" => return run_add(path, &options, UpdateMode::Add, false),
+        "u" => return run_add(path, &options, UpdateMode::Update, false),
+        "f" => return run_add(path, &options, UpdateMode::Freshen, false),
+        "m" | "mf" => return run_add(path, &options, UpdateMode::Add, true),
+        "d" => return run_delete(path, &options),
+        "c" | "ch" | "cw" | "i" | "k" | "r" | "rc" | "rn" | "rr" | "rv" | "s" => {
             eprintln!("Command `{command}` is not implemented yet");
             return Exit::UserError.into();
         }
@@ -115,6 +137,12 @@ fn parse(args: &Args) -> Result<(Options, String), String> {
         quiet: false,
         silent: false,
         selection: Selection::all(),
+        excludes: Selection::all(),
+        level: 6,
+        paths: StorePaths::AsGiven,
+        store_symlinks: false,
+        delete_sources: false,
+        files: Vec::new(),
     };
     for switch in &args.switches {
         let lower = switch.to_lowercase();
@@ -124,13 +152,31 @@ fn parse(args: &Args) -> Result<(Options, String), String> {
             "o-" => options.overwrite = OverwriteMode::Skip,
             "or" => options.overwrite = OverwriteMode::RenameNew,
             "kb" => options.keep_broken = true,
-            "ep" => options.exclude_paths = true,
+            "ep" => {
+                options.exclude_paths = true;
+                options.paths = StorePaths::None;
+            }
+            "ep1" => options.paths = StorePaths::Relative,
+            "ep2" | "ep3" => options.paths = StorePaths::AsGiven,
+            "df" => options.delete_sources = true,
+            "ol" => options.store_symlinks = true,
+            "m0" | "m1" | "m2" | "m3" | "m4" | "m5" => {
+                options.level = match lower.as_bytes()[1] {
+                    b'0' => 0,
+                    b'1' => 1,
+                    b'2' => 3,
+                    b'3' => 6,
+                    b'4' => 8,
+                    _ => 9,
+                };
+            }
             "idq" => options.quiet = true,
             "inul" => options.silent = true,
             "r" | "r-" | "r0" | "c-" | "cfg-" => {}
             _ if lower.starts_with("op") => options.output = Some(PathBuf::from(&switch[2..])),
             _ if lower.starts_with('x') && lower.len() > 1 => {
                 options.selection = options.selection.exclude(&switch[1..]);
+                options.excludes = options.excludes.exclude(&switch[1..]);
             }
             _ if lower.starts_with('n') && lower.len() > 1 => {
                 options.selection = options.selection.include(&switch[1..]);
@@ -146,7 +192,12 @@ fn parse(args: &Args) -> Result<(Options, String), String> {
         .next()
         .cloned()
         .ok_or("ERROR: Archive name is missing")?;
+    let adding = matches!(args.command.as_str(), "a" | "u" | "f" | "m" | "mf");
     for arg in positionals {
+        options.files.push(arg.clone());
+        if adding {
+            continue;
+        }
         if arg.ends_with(['/', '\\']) {
             options.output = Some(PathBuf::from(arg));
         } else {
@@ -154,6 +205,142 @@ fn parse(args: &Args) -> Result<(Options, String), String> {
         }
     }
     Ok((options, archive))
+}
+
+/// Prints one line per archive item the WinRAR way.
+struct UpdateConsole {
+    quiet: bool,
+}
+
+impl UpdateHandler for UpdateConsole {
+    fn item_done(&mut self, name: &str, action: ItemAction) {
+        let verb = match action {
+            ItemAction::Added => "Adding",
+            ItemAction::Replaced => "Updating",
+            ItemAction::Deleted => "Deleting",
+            ItemAction::Kept => return,
+        };
+        if !self.quiet {
+            println!("{verb:<11} {:<56} OK", display_name(name));
+        }
+    }
+
+    fn warning(&mut self, path: &Path, message: &str) {
+        eprintln!("WARNING: Cannot open {}\n{message}", path.display());
+    }
+}
+
+/// RAR appends `.rar` to names without an extension; RarX cannot write RAR yet.
+fn creatable(path: &Path) -> Result<(), ExitCode> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    if ext.is_empty() || ext.eq_ignore_ascii_case("rar") {
+        eprintln!("ERROR: creating RAR archives is not available yet; use a .zip archive name");
+        return Err(Exit::Create.into());
+    }
+    Ok(())
+}
+
+fn run_add(path: &Path, options: &Options, mode: UpdateMode, move_files: bool) -> ExitCode {
+    if let Err(code) = creatable(path) {
+        return code;
+    }
+    if options.files.is_empty() {
+        eprintln!("ERROR: No files to add");
+        return Exit::UserError.into();
+    }
+    let quiet = options.quiet || options.silent;
+    if !options.silent {
+        let verb = if path.exists() {
+            "Updating"
+        } else {
+            "Creating"
+        };
+        println!("{verb} archive {}\n", path.display());
+    }
+    let inputs: Vec<PathBuf> = options.files.iter().map(PathBuf::from).collect();
+    let add_options = AddOptions {
+        level: options.level,
+        paths: options.paths,
+        mode,
+        exclude: options.excludes.clone(),
+        store_symlinks: options.store_symlinks,
+        delete_sources: options.delete_sources || move_files,
+        force_zip64: false,
+    };
+    let mut console = UpdateConsole { quiet };
+    match add(
+        path,
+        &inputs,
+        &add_options,
+        &mut console,
+        &JobControl::default(),
+    ) {
+        Ok(report) if !report.written => {
+            if !options.silent {
+                println!("WARNING: No files");
+            }
+            Exit::NoFiles.into()
+        }
+        Ok(report) => {
+            if !options.silent {
+                println!("Done");
+            }
+            if report.warnings.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                Exit::Warning.into()
+            }
+        }
+        Err(Error::Cancelled) => Exit::UserBreak.into(),
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            Exit::Fatal.into()
+        }
+    }
+}
+
+fn run_delete(path: &Path, options: &Options) -> ExitCode {
+    if options.files.is_empty() {
+        eprintln!("ERROR: No files to delete");
+        return Exit::UserError.into();
+    }
+    if !path.exists() {
+        eprintln!("Cannot open {}\nNo such file or directory", path.display());
+        return Exit::Open.into();
+    }
+    if !options.silent {
+        println!("Deleting from {}\n", path.display());
+    }
+    let mut console = UpdateConsole {
+        quiet: options.quiet || options.silent,
+    };
+    match delete(
+        path,
+        &options.selection,
+        &mut console,
+        &JobControl::default(),
+    ) {
+        Ok(report) if report.deleted == 0 => {
+            if !options.silent {
+                println!("No files to delete");
+            }
+            Exit::NoFiles.into()
+        }
+        Ok(_) => {
+            if !options.silent {
+                println!("Done");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(Error::Cancelled) => Exit::UserBreak.into(),
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            Exit::Fatal.into()
+        }
+    }
 }
 
 fn open(path: &Path) -> Result<Archive, ExitCode> {

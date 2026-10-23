@@ -7,8 +7,9 @@ use std::process::ExitCode;
 use rarx_core::select::Selection;
 use rarx_core::time::to_system_time;
 use rarx_core::{
-    Archive, Entry, Error, ExtractHandler, ExtractOptions, ItemError, JobControl, Outcome,
-    OverwriteChoice, OverwriteMode, PathMode, Report, extract, test,
+    AddOptions, Archive, Entry, Error, ExtractHandler, ExtractOptions, ItemError, JobControl,
+    Outcome, OverwriteChoice, OverwriteMode, PathMode, Report, StorePaths, UpdateHandler,
+    UpdateMode, add, delete, extract, test,
 };
 
 use crate::common::{
@@ -20,24 +21,32 @@ const USAGE: &str = "\
 Usage: rx7 <command> [<switches>...] <archive_name> [<file_names>...]
 
 <Commands>
+  a : Add files to archive
+  d : Delete files from archive
   e : Extract files from archive (without using directory names)
   l : List contents of archive
   t : Test integrity of archive
+  u : Update files to archive
   x : eXtract files with full paths
 
 <Switches>
   -- : Stop switches parsing
   -ao{a|s|t|u} : set Overwrite mode
   -i!{wildcard} : Include filenames
+  -m{Parameters} : set compression Method (-mx[0-9], -mm=Copy|Deflate)
   -o{Directory} : set Output directory
   -r[-] : Recurse subdirectories (accepted; masks always match at any depth)
+  -sdel : delete files after compression
   -slt : show technical information for l (List) command
+  -snl : store symbolic links as links
   -so : write data to stdout
+  -t{Type} : Set type of archive (only zip can be created yet)
   -x!{wildcard} : eXclude filenames
   -y : assume Yes on all queries";
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
+#[allow(clippy::struct_excessive_bools)] // one flag per command-line switch
 struct Options {
     output: Option<PathBuf>,
     overwrite: OverwriteMode,
@@ -45,6 +54,11 @@ struct Options {
     technical: bool,
     to_stdout: bool,
     selection: Selection,
+    excludes: Selection,
+    level: u32,
+    store_symlinks: bool,
+    delete_sources: bool,
+    archive_type: Option<String>,
 }
 
 /// Runs the `rx7` command line.
@@ -76,7 +90,10 @@ pub fn run(args: &[String]) -> ExitCode {
         "t" => with_archive(path, |a| run_test(a, &options)),
         "x" => with_archive(path, |a| run_extract(a, &options, PathMode::Full)),
         "e" => with_archive(path, |a| run_extract(a, &options, PathMode::None)),
-        "a" | "u" | "d" | "rn" | "h" | "b" | "i" => command_line_error(&format!(
+        "a" => run_add(path, &args.positionals[1..], &options, UpdateMode::Add),
+        "u" => run_add(path, &args.positionals[1..], &options, UpdateMode::Update),
+        "d" => run_delete(path, &args.positionals[1..], &options),
+        "rn" | "h" | "b" | "i" => command_line_error(&format!(
             "Command `{}` is not implemented yet",
             args.command
         )),
@@ -92,6 +109,11 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
         technical: false,
         to_stdout: false,
         selection: Selection::all(),
+        excludes: Selection::all(),
+        level: 6,
+        store_symlinks: false,
+        delete_sources: false,
+        archive_type: None,
     };
     for switch in &args.switches {
         let lower = switch.to_lowercase();
@@ -99,7 +121,25 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
             "y" => options.assume_yes = true,
             "slt" => options.technical = true,
             "so" => options.to_stdout = true,
-            "r" | "r-" | "r0" | "bd" => {}
+            "r" | "r-" | "r0" | "bd" | "mm=deflate" | "m0=deflate" => {}
+            "sdel" => options.delete_sources = true,
+            "snl" => options.store_symlinks = true,
+            "mm=copy" | "m0=copy" => options.level = 0,
+            _ if lower.starts_with("mx") => {
+                let digits = lower[2..].trim_start_matches('=');
+                let mx: u32 = if digits.is_empty() {
+                    9
+                } else {
+                    digits
+                        .parse()
+                        .map_err(|_| format!("Unsupported switch: -{switch}"))?
+                };
+                options.level = deflate_level(mx);
+            }
+            _ if lower.starts_with('m') => {
+                return Err(format!("Unsupported compression parameter: -{switch}"));
+            }
+            _ if lower.starts_with('t') => options.archive_type = Some(lower[1..].to_owned()),
             "aoa" => options.overwrite = OverwriteMode::Overwrite,
             "aos" => options.overwrite = OverwriteMode::Skip,
             "aot" => options.overwrite = OverwriteMode::RenameExisting,
@@ -108,6 +148,7 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
             _ if lower.starts_with('o') => options.output = Some(PathBuf::from(&switch[1..])),
             _ if lower.starts_with("x!") => {
                 options.selection = options.selection.exclude(&switch[2..]);
+                options.excludes = options.excludes.exclude(&switch[2..]);
             }
             _ if lower.starts_with("i!") => {
                 options.selection = options.selection.include(&switch[2..]);
@@ -122,6 +163,120 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
         options.selection = options.selection.include(mask);
     }
     Ok(options)
+}
+
+/// Maps 7-Zip `-mx` levels (0–9) onto Deflate levels.
+fn deflate_level(mx: u32) -> u32 {
+    match mx {
+        0 => 0,
+        1..=3 => mx,
+        4 => 5,
+        5 => 6,
+        6 => 7,
+        _ => 9,
+    }
+}
+
+/// Prints added items and unreadable sources the 7-Zip way.
+struct UpdateConsole;
+
+impl UpdateHandler for UpdateConsole {
+    fn warning(&mut self, path: &Path, message: &str) {
+        eprintln!("WARNING: {message} : {}", path.display());
+    }
+}
+
+fn run_add(path: &Path, inputs: &[String], options: &Options, mode: UpdateMode) -> ExitCode {
+    if let Some(kind) = options.archive_type.as_deref().filter(|t| *t != "zip") {
+        eprintln!("ERROR: creating {kind} archives is not supported yet");
+        return Exit::Fatal.into();
+    }
+    let inputs: Vec<PathBuf> = if inputs.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        inputs.iter().map(PathBuf::from).collect()
+    };
+    let exists = path.exists();
+    println!(
+        "{} archive: {}
+",
+        if exists { "Updating" } else { "Creating" },
+        path.display()
+    );
+    let add_options = AddOptions {
+        level: options.level,
+        paths: StorePaths::Relative,
+        mode,
+        exclude: options.excludes.clone(),
+        store_symlinks: options.store_symlinks,
+        delete_sources: options.delete_sources,
+        force_zip64: false,
+    };
+    match add(
+        path,
+        &inputs,
+        &add_options,
+        &mut UpdateConsole,
+        &JobControl::default(),
+    ) {
+        Ok(report) => {
+            println!("Files read from disk: {}", report.added + report.replaced);
+            println!("Archive size: {} bytes", file_size(path));
+            if !report.written {
+                println!("No files to process");
+            }
+            if report.warnings.is_empty() {
+                println!("Everything is Ok");
+                ExitCode::SUCCESS
+            } else {
+                println!("\nWARNINGS for files:\n");
+                for (file, message) in &report.warnings {
+                    println!("{} : {message}", file.display());
+                }
+                println!(
+                    "----------------\nWARNING: Cannot find {} file(s)",
+                    report.warnings.len()
+                );
+                Exit::Warning.into()
+            }
+        }
+        Err(Error::Cancelled) => Exit::UserBreak.into(),
+        Err(err) => {
+            eprintln!("ERROR: {}\n{err}", path.display());
+            Exit::Fatal.into()
+        }
+    }
+}
+
+fn run_delete(path: &Path, masks: &[String], options: &Options) -> ExitCode {
+    if masks.is_empty() {
+        return command_line_error("Cannot find files to delete; specify file names or masks");
+    }
+    let selection = masks.iter().fold(Selection::all(), |sel, m| sel.include(m));
+    let selection = options.excludes_applied(selection);
+    println!("Updating archive: {}\n", path.display());
+    match delete(path, &selection, &mut UpdateConsole, &JobControl::default()) {
+        Ok(report) => {
+            println!("Deleted: {}", report.deleted);
+            println!("Everything is Ok");
+            ExitCode::SUCCESS
+        }
+        Err(Error::Cancelled) => Exit::UserBreak.into(),
+        Err(err) => {
+            eprintln!("ERROR: {}\n{err}", path.display());
+            Exit::Fatal.into()
+        }
+    }
+}
+
+impl Options {
+    /// Adds the `-x!` masks to an include-only selection.
+    fn excludes_applied(&self, selection: Selection) -> Selection {
+        self.excludes
+            .exclusions()
+            .iter()
+            .fold(selection, |sel, m| sel.exclude(m))
+    }
 }
 
 fn command_line_error(message: &str) -> ExitCode {

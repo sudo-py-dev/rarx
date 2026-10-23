@@ -14,6 +14,7 @@ mod job;
 pub mod sanitize;
 pub mod select;
 pub mod time;
+mod update;
 
 pub use archive::{Archive, detect_file};
 pub use error::{Error, Result};
@@ -23,3 +24,7 @@ pub use extract::{
 };
 pub use job::JobControl;
 pub use rarx_formats::{DataError, Entry, EntryKind, FileTime, FormatError, FormatId};
+pub use update::{
+    AddOptions, ItemAction, SilentUpdate, StorePaths, UpdateHandler, UpdateMode, UpdateReport, add,
+    delete,
+};

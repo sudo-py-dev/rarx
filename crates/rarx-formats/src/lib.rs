@@ -11,7 +11,7 @@ mod error;
 mod reader;
 mod signature;
 mod verify;
-mod zip;
+pub mod zip;
 
 pub use entry::{CivilTime, Entry, EntryKind, FileTime};
 pub use error::{DataError, FormatError};

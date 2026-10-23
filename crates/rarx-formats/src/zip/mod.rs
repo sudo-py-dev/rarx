@@ -1,4 +1,4 @@
-//! ZIP / ZIP64 reader (AGENT.md §6.4).
+//! ZIP / ZIP64 reader and writer (AGENT.md §6.4).
 //!
 //! The central directory is authoritative for names, sizes and CRCs; local headers
 //! are only used to find where each item's data starts. Data prepended to the
@@ -6,8 +6,9 @@
 //! where the end record says it should be.
 
 mod cp437;
+mod writer;
 
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use flate2::bufread::DeflateDecoder;
 use rarx_checksum::{Checksum, Crc32};
@@ -15,6 +16,8 @@ use rarx_io::Cursor;
 
 use crate::verify::VerifyReader;
 use crate::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, ReadSeek};
+
+pub use writer::{NewItem, ZipMethod, ZipWriter};
 
 const LOCAL_SIG: u32 = 0x0403_4B50;
 const CENTRAL_SIG: u32 = 0x0201_4B50;
@@ -29,6 +32,7 @@ const LOCAL_HEADER_LEN: u64 = 30;
 const MAX_COMMENT_LEN: u64 = 0xFFFF;
 
 const FLAG_ENCRYPTED: u16 = 1 << 0;
+const FLAG_DATA_DESCRIPTOR: u16 = 1 << 3;
 const FLAG_UTF8: u16 = 1 << 11;
 
 const HOST_UNIX: u8 = 3;
@@ -42,13 +46,29 @@ const S_IFLNK: u32 = 0o120_000;
 const METHOD_STORE: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 
+/// Central-directory fields of an item, kept verbatim so it can be copied into a
+/// new archive without recompressing.
+#[derive(Clone, Debug)]
+pub(crate) struct RawHeader {
+    made_by: u16,
+    needed: u16,
+    flags: u16,
+    method: u16,
+    dos_time: u16,
+    dos_date: u16,
+    crc32: u32,
+    external: u32,
+    name: Vec<u8>,
+    /// Extra fields other than ZIP64, which is rebuilt on write.
+    extra: Vec<u8>,
+    comment: Vec<u8>,
+}
+
 /// Where to find an item's data, beyond what [`Entry`] exposes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Location {
     local_header: u64,
-    method: u16,
-    flags: u16,
-    crc32: u32,
+    header: RawHeader,
 }
 
 /// Location of the central directory, taken from the (ZIP64) end records.
@@ -61,7 +81,7 @@ struct Directory {
 }
 
 /// An open ZIP archive.
-pub(crate) struct ZipReader {
+pub struct ZipReader {
     src: Box<dyn ReadSeek>,
     entries: Vec<Entry>,
     locations: Vec<Location>,
@@ -69,7 +89,11 @@ pub(crate) struct ZipReader {
 }
 
 impl ZipReader {
-    pub(crate) fn new(mut src: Box<dyn ReadSeek>) -> Result<Self, FormatError> {
+    /// Reads the directory of the ZIP archive in `src`.
+    ///
+    /// # Errors
+    /// [`FormatError`] if no valid end record or central directory is found.
+    pub fn new(mut src: Box<dyn ReadSeek>) -> Result<Self, FormatError> {
         let dir = find_directory(&mut src)?;
         let start = dir
             .offset
@@ -101,6 +125,46 @@ impl ZipReader {
             comment: dir.comment,
         })
     }
+
+    /// Seeks to the start of item `index`'s compressed data.
+    fn seek_to_data(&mut self, index: usize) -> Result<(), FormatError> {
+        let local_header = self
+            .locations
+            .get(index)
+            .ok_or_else(|| corrupt("no such item"))?
+            .local_header;
+        self.src.seek(SeekFrom::Start(local_header))?;
+        let mut header = [0u8; 30];
+        self.src.read_exact(&mut header)?;
+        let mut cur = Cursor::new(&header);
+        if cur.read_u32_le()? != LOCAL_SIG {
+            return Err(corrupt("local header signature not found"));
+        }
+        cur.skip(22)?;
+        let name_len = u64::from(cur.read_u16_le()?);
+        let extra_len = u64::from(cur.read_u16_le()?);
+        let data_start = local_header.saturating_add(LOCAL_HEADER_LEN + name_len + extra_len);
+        self.src.seek(SeekFrom::Start(data_start))?;
+        Ok(())
+    }
+
+    /// Copies item `index` into `out` as is: compressed (and possibly encrypted)
+    /// bytes plus metadata, without decoding.
+    ///
+    /// # Errors
+    /// [`FormatError`] if the item cannot be located or read, or writing fails.
+    pub fn copy_raw<W: Write + Seek>(
+        &mut self,
+        index: usize,
+        out: &mut ZipWriter<W>,
+    ) -> Result<(), FormatError> {
+        self.seek_to_data(index)?;
+        let entry = &self.entries[index];
+        let (size, packed) = (entry.size, entry.packed_size);
+        let header = &self.locations[index].header;
+        out.add_raw(header, size, packed, &mut self.src)
+            .map_err(FormatError::Io)
+    }
 }
 
 impl ArchiveReader for ZipReader {
@@ -121,29 +185,16 @@ impl ArchiveReader for ZipReader {
             .entries
             .get(index)
             .ok_or_else(|| corrupt("no such item"))?;
-        let loc = self.locations[index];
-        if loc.flags & FLAG_ENCRYPTED != 0 {
+        let (size, packed) = (entry.size, entry.packed_size);
+        let header = &self.locations[index].header;
+        let (method, flags, crc32) = (header.method, header.flags, header.crc32);
+        if flags & FLAG_ENCRYPTED != 0 {
             return Err(FormatError::Encrypted);
         }
-        let (size, packed) = (entry.size, entry.packed_size);
-
-        self.src.seek(SeekFrom::Start(loc.local_header))?;
-        let mut header = [0u8; 30];
-        self.src.read_exact(&mut header)?;
-        let mut cur = Cursor::new(&header);
-        if cur.read_u32_le()? != LOCAL_SIG {
-            return Err(corrupt("local header signature not found"));
-        }
-        cur.skip(22)?;
-        let name_len = u64::from(cur.read_u16_le()?);
-        let extra_len = u64::from(cur.read_u16_le()?);
-        let data_start = loc
-            .local_header
-            .saturating_add(LOCAL_HEADER_LEN + name_len + extra_len);
-        self.src.seek(SeekFrom::Start(data_start))?;
+        self.seek_to_data(index)?;
 
         let raw = (&mut self.src).take(packed);
-        let decoded: Box<dyn Read + '_> = match loc.method {
+        let decoded: Box<dyn Read + '_> = match method {
             METHOD_STORE if packed != size => {
                 return Err(corrupt(
                     "stored item has different packed and unpacked sizes",
@@ -158,7 +209,7 @@ impl ArchiveReader for ZipReader {
                 )));
             }
         };
-        Ok(Box::new(VerifyReader::new(decoded, size, loc.crc32)))
+        Ok(Box::new(VerifyReader::new(decoded, size, crc32)))
     }
 }
 
@@ -285,7 +336,7 @@ fn parse_central_header(cur: &mut Cursor<'_>) -> Result<(Entry, Location), Forma
         return Err(corrupt("central directory header signature not found"));
     }
     let made_by = cur.read_u16_le()?;
-    cur.skip(2)?;
+    let needed = cur.read_u16_le()?;
     let flags = cur.read_u16_le()?;
     let method = cur.read_u16_le()?;
     let dos_time = cur.read_u16_le()?;
@@ -346,15 +397,7 @@ fn parse_central_header(cur: &mut Cursor<'_>) -> Result<(Entry, Location), Forma
     }
 
     let name = unicode_name.unwrap_or_else(|| decode_name(raw_name, flags, host));
-    let unix_mode = matches!(host, HOST_UNIX | HOST_MACOS)
-        .then_some(external >> 16)
-        .filter(|&mode| mode != 0);
-    let kind = match unix_mode.map(|m| m & S_IFMT) {
-        Some(S_IFLNK) => EntryKind::Symlink,
-        Some(S_IFDIR) => EntryKind::Directory,
-        _ if name.ends_with('/') || external & DOS_DIRECTORY != 0 => EntryKind::Directory,
-        _ => EntryKind::File,
-    };
+    let (kind, unix_mode) = classify(&name, host, external);
     let name = name.trim_end_matches('/').to_owned();
 
     let mut entry = Entry::new(name, kind);
@@ -369,15 +412,40 @@ fn parse_central_header(cur: &mut Cursor<'_>) -> Result<(Entry, Location), Forma
     entry.unix_mode = unix_mode;
     entry.dos_attributes = Some(external & 0xFFFF);
     entry.comment = (!raw_comment.is_empty()).then(|| decode_name(raw_comment, flags, host));
+    let header = RawHeader {
+        made_by,
+        needed,
+        flags,
+        method,
+        dos_time,
+        dos_date,
+        crc32,
+        external,
+        name: raw_name.to_vec(),
+        extra: extra.to_vec(),
+        comment: raw_comment.to_vec(),
+    };
     Ok((
         entry,
         Location {
             local_header,
-            method,
-            flags,
-            crc32,
+            header,
         },
     ))
+}
+
+/// Determines the item kind and Unix mode from the name and external attributes.
+fn classify(name: &str, host: u8, external: u32) -> (EntryKind, Option<u32>) {
+    let unix_mode = matches!(host, HOST_UNIX | HOST_MACOS)
+        .then_some(external >> 16)
+        .filter(|&mode| mode != 0);
+    let kind = match unix_mode.map(|m| m & S_IFMT) {
+        Some(S_IFLNK) => EntryKind::Symlink,
+        Some(S_IFDIR) => EntryKind::Directory,
+        _ if name.ends_with('/') || external & DOS_DIRECTORY != 0 => EntryKind::Directory,
+        _ => EntryKind::File,
+    };
+    (kind, unix_mode)
 }
 
 /// Splits an extra-field block into `(header id, data)` pairs, ignoring a
