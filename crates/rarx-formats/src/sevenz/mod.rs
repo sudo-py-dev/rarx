@@ -13,9 +13,10 @@ use std::io::{self, Read, SeekFrom};
 use std::sync::{Arc, Mutex};
 
 use rarx_checksum::{Checksum, Crc32};
+use rarx_crypto::Password;
 use rarx_io::Cursor;
 
-use self::coders::{AES, Shared, Stream, folder_stream, method_label, read_folder_to_vec};
+use self::coders::{AES, Crypto, Shared, Stream, folder_stream, method_label, read_folder_to_vec};
 use self::header::{Folder, Header, K_ENCODED_HEADER, K_HEADER, parse_header, parse_streams_info};
 use crate::verify::VerifyReader;
 use crate::{ArchiveReader, Entry, EntryKind, FormatError, FormatId, ReadSeek};
@@ -63,6 +64,8 @@ pub struct SevenZReader {
     /// Size of each file stream, per folder.
     stream_sizes: Vec<Vec<u64>>,
     cursor: Option<FolderCursor>,
+    crypto: Crypto,
+    header_encrypted: bool,
 }
 
 fn corrupt(what: &str) -> FormatError {
@@ -70,11 +73,17 @@ fn corrupt(what: &str) -> FormatError {
 }
 
 impl SevenZReader {
-    /// Reads the header database of the 7z archive in `src`.
+    /// Reads the header database of the 7z archive in `src`. `password` is needed
+    /// up front only when the header itself is encrypted.
     ///
     /// # Errors
-    /// [`FormatError`] if the signature, start header or header database is invalid.
-    pub fn new(mut src: Box<dyn ReadSeek>) -> Result<Self, FormatError> {
+    /// [`FormatError`] if the signature, start header or header database is invalid;
+    /// [`FormatError::Encrypted`] or [`FormatError::WrongPassword`] for an encrypted
+    /// header without the right password.
+    pub fn new(
+        mut src: Box<dyn ReadSeek>,
+        password: Option<Password>,
+    ) -> Result<Self, FormatError> {
         let file_len = src.seek(SeekFrom::End(0))?;
         src.seek(SeekFrom::Start(0))?;
         let mut start = [0u8; 32];
@@ -107,6 +116,11 @@ impl SevenZReader {
             packs: Vec::new(),
             stream_sizes: Vec::new(),
             cursor: None,
+            crypto: Crypto {
+                password,
+                ..Crypto::default()
+            },
+            header_encrypted: false,
         };
         if next_size == 0 {
             return Ok(reader);
@@ -132,6 +146,12 @@ impl SevenZReader {
         Ok(reader)
     }
 
+    /// Whether the header database (file names) is encrypted.
+    #[must_use]
+    pub fn is_header_encrypted(&self) -> bool {
+        self.header_encrypted
+    }
+
     /// Whether any block holds more than one file.
     #[must_use]
     pub fn is_solid(&self) -> bool {
@@ -145,7 +165,7 @@ impl SevenZReader {
     }
 
     /// Unwraps `kEncodedHeader` layers until a plain `kHeader` remains.
-    fn decode_header(&self, mut raw: Vec<u8>, file_len: u64) -> Result<Header, FormatError> {
+    fn decode_header(&mut self, mut raw: Vec<u8>, file_len: u64) -> Result<Header, FormatError> {
         for _ in 0..MAX_HEADER_LEVELS {
             let mut cur = Cursor::new(&raw);
             match cur.read_u8()? {
@@ -157,17 +177,22 @@ impl SevenZReader {
                         .folders
                         .first()
                         .ok_or_else(|| corrupt("encoded header has no folder"))?;
-                    if folder.coders.iter().any(|c| c.id == AES) {
-                        return Err(FormatError::Encrypted);
-                    }
+                    let encrypted = folder.coders.iter().any(|c| c.id == AES);
+                    self.header_encrypted |= encrypted;
                     let mine = &packs[folder.first_pack_stream..][..folder.packed_streams.len()];
-                    let decoded = read_folder_to_vec(&self.src, folder, mine, MAX_HEADER)?;
-                    if folder
-                        .crc
-                        .is_some_and(|crc| crc != Crc32::checksum(&decoded))
-                    {
-                        return Err(corrupt("compressed header CRC mismatch"));
-                    }
+                    let decoded =
+                        read_folder_to_vec(&self.src, folder, mine, MAX_HEADER, &mut self.crypto);
+                    let decoded = match decoded {
+                        Ok(data) if folder.crc.is_none_or(|crc| crc == Crc32::checksum(&data)) => {
+                            data
+                        }
+                        // A wrong key yields garbage that fails to decode or to match.
+                        Ok(_) | Err(FormatError::Io(_) | FormatError::Corrupt(_)) if encrypted => {
+                            return Err(FormatError::WrongPassword);
+                        }
+                        Ok(_) => return Err(corrupt("compressed header CRC mismatch")),
+                        Err(err) => return Err(err),
+                    };
                     raw = decoded;
                 }
                 _ => return Err(corrupt("unknown header type")),
@@ -263,7 +288,7 @@ impl SevenZReader {
                 .packs
                 .get(f.first_pack_stream..f.first_pack_stream + f.packed_streams.len())
                 .ok_or_else(|| corrupt("folder references missing pack streams"))?;
-            let stream = folder_stream(&self.src, f, packs)?;
+            let stream = folder_stream(&self.src, f, packs, &mut self.crypto)?;
             self.cursor = Some(FolderCursor {
                 folder,
                 next: 0,
@@ -348,6 +373,14 @@ impl ArchiveReader for SevenZReader {
         None
     }
 
+    fn set_password(&mut self, password: Option<Password>) {
+        self.crypto = Crypto {
+            password,
+            ..Crypto::default()
+        };
+        self.cursor = None;
+    }
+
     fn open_entry(&mut self, index: usize) -> Result<Box<dyn Read + '_>, FormatError> {
         let entry = self
             .entries
@@ -357,9 +390,6 @@ impl ArchiveReader for SevenZReader {
         let Some(location) = self.locations[index] else {
             return Ok(Box::new(io::empty()));
         };
-        if entry.encrypted {
-            return Err(FormatError::Encrypted);
-        }
         let cursor = self.seek_stream(location.folder, location.ordinal)?;
         cursor.next = location.ordinal + 1;
         let stream = ItemStream {

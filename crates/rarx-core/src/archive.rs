@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use rarx_formats::{ArchiveReader, Entry, FormatError, FormatId};
+use rarx_formats::{ArchiveReader, Entry, FormatError, FormatId, Password};
 
 use crate::{Error, Result};
 
@@ -42,6 +42,16 @@ impl Archive {
     /// [`Error::UnknownFormat`] if no reader accepts the file, [`Error::Io`] if it
     /// cannot be read, or [`Error::Format`] if its headers are invalid.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_password(path, None)
+    }
+
+    /// Like [`Archive::open`], with a password for encrypted headers and items.
+    ///
+    /// # Errors
+    /// As [`Archive::open`]; also [`Error::Format`] with
+    /// [`FormatError::Encrypted`] or [`FormatError::WrongPassword`] when the header
+    /// is encrypted and `password` is missing or wrong.
+    pub fn open_with_password(path: &Path, password: Option<Password>) -> Result<Self> {
         let format = match detect_file(path)? {
             Some(format) => format,
             None if has_zip_extension(path) => FormatId::Zip,
@@ -50,7 +60,7 @@ impl Archive {
         };
         let src = Box::new(BufReader::new(File::open(path)?));
         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-        let reader = rarx_formats::open(format, src, &stem).map_err(|err| match err {
+        let reader = rarx_formats::open(format, src, &stem, password).map_err(|err| match err {
             FormatError::Corrupt(_) if format == FormatId::Zip && !starts_like_zip(path) => {
                 Error::UnknownFormat(path.to_owned())
             }
@@ -93,6 +103,17 @@ impl Archive {
     /// encryption, damaged headers).
     pub fn read_entry(&mut self, index: usize) -> Result<Box<dyn Read + '_>> {
         Ok(self.reader.open_entry(index)?)
+    }
+
+    /// Whether any item is encrypted.
+    #[must_use]
+    pub fn has_encrypted_items(&self) -> bool {
+        self.entries().iter().any(|e| e.encrypted)
+    }
+
+    /// Sets the password for encrypted items read from now on.
+    pub fn set_password(&mut self, password: Option<Password>) {
+        self.reader.set_password(password);
     }
 
     pub(crate) fn reader_mut(&mut self) -> &mut dyn ArchiveReader {

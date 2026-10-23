@@ -10,10 +10,12 @@ publish.workspace = true
 [dependencies]
 rarx-io.workspace = true
 rarx-checksum.workspace = true
+rarx-crypto.workspace = true
 flate2.workspace = true
 lzma-rust2.workspace = true
 bzip2.workspace = true
 zstd.workspace = true
+ppmd-rust.workspace = true
 
 [lints]
 workspace = true

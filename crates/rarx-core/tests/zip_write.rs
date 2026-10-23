@@ -317,6 +317,7 @@ fn delete_by_mask() {
     let report = delete(
         &zip,
         &Selection::all().include("docs"),
+        None,
         &mut SilentUpdate,
         &JobControl::default(),
     )
@@ -327,6 +328,7 @@ fn delete_by_mask() {
     let none = delete(
         &zip,
         &Selection::all().include("*.zzz"),
+        None,
         &mut SilentUpdate,
         &JobControl::default(),
     )

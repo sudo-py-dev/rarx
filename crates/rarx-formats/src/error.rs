@@ -14,8 +14,10 @@ pub enum FormatError {
     Corrupt(String),
     /// The archive uses a feature RarX does not implement yet.
     Unsupported(String),
-    /// The item is encrypted and no usable password was supplied.
+    /// The item is encrypted and no password was supplied.
     Encrypted,
+    /// The supplied password does not decrypt the item or header.
+    WrongPassword,
 }
 
 impl fmt::Display for FormatError {
@@ -26,6 +28,7 @@ impl fmt::Display for FormatError {
             Self::Corrupt(what) => write!(f, "corrupt archive: {what}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Encrypted => f.write_str("encrypted data needs a password"),
+            Self::WrongPassword => f.write_str("wrong password"),
         }
     }
 }

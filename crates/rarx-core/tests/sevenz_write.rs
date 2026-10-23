@@ -180,6 +180,7 @@ fn update_and_delete_keep_other_items() {
     let report = delete(
         &archive,
         &Selection::all().include("b.txt"),
+        None,
         &mut SilentUpdate,
         &JobControl::default(),
     )

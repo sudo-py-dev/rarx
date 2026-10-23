@@ -8,6 +8,8 @@ use lzma_rust2::filter::bcj::BcjReader;
 use lzma_rust2::filter::bcj2::Bcj2Reader;
 use lzma_rust2::filter::delta::DeltaReader;
 use lzma_rust2::{Lzma2Reader, LzmaReader};
+use rarx_crypto::Password;
+use rarx_crypto::sevenz::{AesParams, DecryptReader, KeyCache};
 
 use super::header::{Coder, Folder};
 use crate::FormatError;
@@ -18,6 +20,8 @@ pub(super) type Stream = Box<dyn Read + Send>;
 
 const REGION_BUFFER: usize = 64 * 1024;
 const MIN_DICTIONARY: u64 = 4096;
+/// Largest PPMd model accepted when reading (7-Zip's own encoder stops at 2 GiB).
+const MAX_PPMD_MEMORY: u32 = 1 << 31;
 
 const COPY: &[u8] = &[0x00];
 const DELTA: &[u8] = &[0x03];
@@ -39,12 +43,20 @@ const DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
 const ZSTD: &[u8] = &[0x04, 0xF7, 0x11, 0x01];
 pub(super) const AES: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 
+/// The password (if any) and the keys derived from it so far.
+#[derive(Default)]
+pub(super) struct Crypto {
+    pub password: Option<Password>,
+    pub keys: KeyCache,
+}
+
 /// Builds the decoded stream of `folder`. `packs` holds the absolute `(offset, size)`
 /// of each of the folder's pack streams.
 pub(super) fn folder_stream(
     src: &Shared,
     folder: &Folder,
     packs: &[(u64, u64)],
+    crypto: &mut Crypto,
 ) -> Result<Stream, FormatError> {
     let main = folder
         .main_output()
@@ -53,6 +65,7 @@ pub(super) fn folder_stream(
         src,
         folder,
         packs,
+        crypto,
         depth: 0,
     };
     graph.output(main)
@@ -62,6 +75,7 @@ struct Graph<'a> {
     src: &'a Shared,
     folder: &'a Folder,
     packs: &'a [(u64, u64)],
+    crypto: &'a mut Crypto,
     depth: usize,
 }
 
@@ -99,7 +113,7 @@ impl Graph<'_> {
             .copied()
             .unwrap_or(0);
         self.depth -= 1;
-        decoder(coder, inputs, size)
+        decoder(coder, inputs, size, self.crypto)
     }
 
     /// Stream feeding coder input `in_index`: a pack stream or another coder.
@@ -128,7 +142,12 @@ impl Graph<'_> {
 }
 
 /// Creates the decoder for one coder over its input streams.
-fn decoder(coder: &Coder, mut inputs: Vec<Stream>, size: u64) -> Result<Stream, FormatError> {
+fn decoder(
+    coder: &Coder,
+    mut inputs: Vec<Stream>,
+    size: u64,
+    crypto: &mut Crypto,
+) -> Result<Stream, FormatError> {
     let unsupported = || FormatError::Unsupported(format!("7z method {}", method_label(coder)));
     let bad_props =
         || FormatError::Corrupt(format!("7z {} properties are invalid", method_label(coder)));
@@ -181,7 +200,29 @@ fn decoder(coder: &Coder, mut inputs: Vec<Stream>, size: u64) -> Result<Stream, 
         IA64 => Box::new(BcjReader::new_ia64(input, 0)),
         RISCV => Box::new(BcjReader::new_riscv(input, 0)),
         DEFLATE => Box::new(DeflateDecoder::new(BufReader::new(input))),
-        AES => return Err(FormatError::Encrypted),
+        BZIP2 => Box::new(bzip2::read::BzDecoder::new(input)),
+        ZSTD => Box::new(zstd::stream::read::Decoder::new(input).map_err(FormatError::Io)?),
+        PPMD => {
+            let [order, m0, m1, m2, m3] = coder.props[..] else {
+                return Err(bad_props());
+            };
+            let memory = u32::from_le_bytes([m0, m1, m2, m3]);
+            if memory > MAX_PPMD_MEMORY {
+                return Err(FormatError::Unsupported(format!(
+                    "PPMd model of {} MiB",
+                    memory >> 20
+                )));
+            }
+            let decoder = ppmd_rust::Ppmd7Decoder::new(input, u32::from(order), memory)
+                .map_err(|_| bad_props())?;
+            Box::new(decoder.take(size))
+        }
+        AES => {
+            let password = crypto.password.as_ref().ok_or(FormatError::Encrypted)?;
+            let params = AesParams::parse(&coder.props).ok_or_else(bad_props)?;
+            let key = crypto.keys.key(password, &params);
+            Box::new(DecryptReader::new(input, &key, &params))
+        }
         _ => return Err(unsupported()),
     })
 }
@@ -250,6 +291,7 @@ pub(super) fn read_folder_to_vec(
     folder: &Folder,
     packs: &[(u64, u64)],
     limit: u64,
+    crypto: &mut Crypto,
 ) -> Result<Vec<u8>, FormatError> {
     let size = folder.unpack_size();
     if size > limit {
@@ -258,7 +300,7 @@ pub(super) fn read_folder_to_vec(
         ));
     }
     let mut out = Vec::new();
-    folder_stream(src, folder, packs)?
+    folder_stream(src, folder, packs, crypto)?
         .take(size)
         .read_to_end(&mut out)?;
     if out.len() as u64 != size {

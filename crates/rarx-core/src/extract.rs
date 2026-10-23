@@ -98,6 +98,8 @@ pub enum ItemError {
     Unsupported(String),
     /// The item is encrypted and no password was available.
     Encrypted,
+    /// The password does not decrypt the item.
+    WrongPassword,
     /// The item's name has no safe on-disk equivalent, or a folder on its path is a
     /// symbolic link.
     UnsafePath,
@@ -113,7 +115,8 @@ impl fmt::Display for ItemError {
             Self::Checksum => f.write_str("CRC failed"),
             Self::Data(what) => write!(f, "data error: {what}"),
             Self::Unsupported(what) => write!(f, "unsupported {what}"),
-            Self::Encrypted => f.write_str("encrypted (passwords are not supported yet)"),
+            Self::Encrypted => f.write_str("encrypted, a password is needed"),
+            Self::WrongPassword => f.write_str("wrong password"),
             Self::UnsafePath => f.write_str("unsafe path, skipped"),
             Self::UnsafeLink(target) => write!(f, "dangerous link target `{target}`, skipped"),
             Self::Io(what) => f.write_str(what),
@@ -171,6 +174,16 @@ pub struct Report {
 
 impl Report {
     fn record(&mut self, entry: &Entry, outcome: &Outcome, handler: &mut dyn ExtractHandler) {
+        // With most ciphers a wrong key only shows up as garbage that fails to
+        // decode or to match its checksum.
+        let blamed;
+        let outcome = match outcome {
+            Outcome::Failed(ItemError::Checksum | ItemError::Data(_)) if entry.encrypted => {
+                blamed = Outcome::Failed(ItemError::WrongPassword);
+                &blamed
+            }
+            other => other,
+        };
         match outcome {
             Outcome::Ok => match entry.kind {
                 EntryKind::File => self.files += 1,
@@ -532,6 +545,7 @@ fn data_error(err: &io::Error) -> ItemError {
 fn format_error(err: FormatError) -> ItemError {
     match err {
         FormatError::Encrypted => ItemError::Encrypted,
+        FormatError::WrongPassword => ItemError::WrongPassword,
         FormatError::Unsupported(what) => ItemError::Unsupported(what),
         other => ItemError::Data(other.to_string()),
     }

@@ -1,10 +1,10 @@
 //! Pieces shared by both command-line dialects.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use rarx_core::time::format_local;
-use rarx_core::{Entry, EntryKind, FileTime, Report};
+use rarx_core::{Archive, Entry, EntryKind, Error, FileTime, FormatError, Password, Report};
 
 /// Arguments split into command, switches and positional arguments.
 #[derive(Debug, Default)]
@@ -130,6 +130,123 @@ pub fn ask(question: &str) -> Option<String> {
     match io::stdin().lock().read_line(&mut line) {
         Ok(0) | Err(_) => None,
         Ok(_) => Some(line.trim().to_lowercase()),
+    }
+}
+
+/// What a `-p` switch asked for.
+#[derive(Clone, Debug, Default)]
+pub enum PasswordArg {
+    /// No switch: ask only when the archive turns out to need a password.
+    #[default]
+    Unset,
+    /// `-p<password>`.
+    Given(Password),
+    /// `-p` alone: ask before starting.
+    Ask,
+    /// `-p-`: never ask.
+    Never,
+}
+
+impl PasswordArg {
+    /// Interprets the text after `-p` (case preserved).
+    #[must_use]
+    pub fn from_switch(value: &str) -> Self {
+        match value {
+            "" => Self::Ask,
+            "-" => Self::Never,
+            text => Self::Given(Password::from(text)),
+        }
+    }
+
+    /// The password to start with, asking now for `-p` alone. With `confirm`
+    /// (creating an archive) the password must be typed twice.
+    ///
+    /// # Errors
+    /// A message when input ends or the two entries differ.
+    pub fn initial(&self, confirm: bool) -> Result<Option<Password>, String> {
+        match self {
+            Self::Given(pw) => Ok(Some(pw.clone())),
+            Self::Unset | Self::Never => Ok(None),
+            Self::Ask => {
+                let first = read_password("Enter password (will not be echoed): ")
+                    .ok_or("No password was entered")?;
+                if confirm && io::stdin().is_terminal() {
+                    let again =
+                        read_password("Reenter password: ").ok_or("No password was entered")?;
+                    if again.utf8() != first.utf8() {
+                        return Err("The passwords do not match".to_owned());
+                    }
+                }
+                Ok(Some(first))
+            }
+        }
+    }
+
+    /// Whether RarX may ask for a password the archive turns out to need.
+    #[must_use]
+    pub fn may_ask(&self) -> bool {
+        matches!(self, Self::Unset)
+    }
+}
+
+/// Reads a password: without echo from a terminal, else one line of standard input.
+/// Returns `None` at end of input.
+#[must_use]
+pub fn read_password(prompt: &str) -> Option<Password> {
+    if io::stdin().is_terminal() {
+        return rpassword::prompt_password(prompt).ok().map(Password::new);
+    }
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    match io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => {
+            let end = line.trim_end_matches(['\r', '\n']).len();
+            line.truncate(end);
+            Some(Password::new(line))
+        }
+    }
+}
+
+/// Opens `path`; if its header is encrypted and no password is known yet, asks for
+/// one (when `arg` allows) and tries again.
+///
+/// # Errors
+/// Whatever [`Archive::open_with_password`] reports.
+pub fn open_archive(
+    path: &Path,
+    arg: &PasswordArg,
+    password: &mut Option<Password>,
+) -> rarx_core::Result<Archive> {
+    match Archive::open_with_password(path, password.clone()) {
+        Err(Error::Format(FormatError::Encrypted)) if password.is_none() && arg.may_ask() => {
+            *password = read_password(&format!(
+                "Enter password (will not be echoed) for {}: ",
+                path.display()
+            ));
+            if password.is_none() {
+                return Err(Error::Format(FormatError::Encrypted));
+            }
+            Archive::open_with_password(path, password.clone())
+        }
+        other => other,
+    }
+}
+
+/// Before extracting or testing: asks for a password if items are encrypted and
+/// none is known yet.
+pub fn ensure_item_password(
+    archive: &mut Archive,
+    arg: &PasswordArg,
+    password: &mut Option<Password>,
+) {
+    if password.is_none() && arg.may_ask() && archive.has_encrypted_items() {
+        *password = read_password(&format!(
+            "Enter password (will not be echoed) for {}: ",
+            archive.path().display()
+        ));
+        archive.set_password(password.clone());
     }
 }
 

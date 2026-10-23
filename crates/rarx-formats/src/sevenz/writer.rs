@@ -1,12 +1,14 @@
 //! 7z writer (AGENT.md §6.1): LZMA2 or Copy folders, solid or one folder per file,
-//! and an LZMA-compressed header.
+//! an LZMA-compressed header, and optional AES-256 encryption of data and header.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use lzma_rust2::{Lzma2Options, Lzma2Writer, LzmaOptions, LzmaWriter};
 use rarx_checksum::{Checksum, Crc32};
+use rarx_crypto::Password;
+use rarx_crypto::sevenz::{AesParams, DEFAULT_CYCLES_POWER, EncryptWriter, Key, derive_key};
 
-use super::coders::lzma2_dictionary;
+use super::coders::{AES, lzma2_dictionary};
 use super::header::{K_ENCODED_HEADER, K_END, K_HEADER};
 use super::{ATTR_DIRECTORY, ATTR_UNIX_EXTENSION, S_IFDIR, S_IFLNK, SIGNATURE};
 use crate::{EntryKind, FileTime, NewItem};
@@ -34,7 +36,7 @@ const HEADER_DICTIONARY: u32 = 1 << 20;
 const COPY_BUFFER: usize = 256 * 1024;
 
 /// Settings for new 7z archives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SevenZOptions {
     /// 0 stores (Copy); 1–9 select the LZMA2 preset.
     pub level: u32,
@@ -42,6 +44,11 @@ pub struct SevenZOptions {
     pub solid: bool,
     /// Compress the header database with LZMA.
     pub compress_header: bool,
+    /// Encrypt file data with AES-256.
+    pub password: Option<Password>,
+    /// Also encrypt the header (file names); needs `password`, implies
+    /// `compress_header`.
+    pub encrypt_header: bool,
 }
 
 impl Default for SevenZOptions {
@@ -50,6 +57,8 @@ impl Default for SevenZOptions {
             level: 5,
             solid: true,
             compress_header: true,
+            password: None,
+            encrypt_header: false,
         }
     }
 }
@@ -72,9 +81,60 @@ impl<W: Write> Write for Counting<W> {
     }
 }
 
+/// Where a coder's output goes: straight to the archive, or through AES first.
+enum Sink<W: Write> {
+    Plain(Counting<W>),
+    /// Counts the compressed bytes (the AES coder's unpacked size) on the way in.
+    Aes(Counting<EncryptWriter<Counting<W>>>),
+}
+
+impl<W: Write> Sink<W> {
+    fn new(out: W, crypto: Option<&(Key, AesParams)>) -> Self {
+        let counting = Counting {
+            inner: out,
+            count: 0,
+        };
+        match crypto {
+            None => Self::Plain(counting),
+            Some((key, params)) => Self::Aes(Counting {
+                inner: EncryptWriter::new(counting, key, params),
+                count: 0,
+            }),
+        }
+    }
+
+    /// Ends the stream; returns the sink, bytes written to it, and the size
+    /// before encryption when encrypting.
+    fn finish(self) -> io::Result<(W, u64, Option<u64>)> {
+        match self {
+            Self::Plain(w) => Ok((w.inner, w.count, None)),
+            Self::Aes(w) => {
+                let out = w.inner.finish()?;
+                Ok((out.inner, out.count, Some(w.count)))
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for Sink<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(w) => w.write(buf),
+            Self::Aes(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush(),
+            Self::Aes(w) => w.flush(),
+        }
+    }
+}
+
 enum Encoder<W: Write> {
-    Copy(Counting<W>),
-    Lzma2(Box<Lzma2Writer<Counting<W>>>),
+    Copy(Sink<W>),
+    Lzma2(Box<Lzma2Writer<Sink<W>>>),
 }
 
 impl<W: Write> Encoder<W> {
@@ -85,7 +145,7 @@ impl<W: Write> Encoder<W> {
         }
     }
 
-    fn finish(self) -> io::Result<Counting<W>> {
+    fn finish(self) -> io::Result<Sink<W>> {
         match self {
             Self::Copy(w) => Ok(w),
             Self::Lzma2(w) => w.finish(),
@@ -96,15 +156,62 @@ impl<W: Write> Encoder<W> {
 /// A folder being written.
 struct OpenFolder<W: Write> {
     encoder: Encoder<W>,
-    coder: Vec<u8>,
+    /// The compression coder record, or `None` for Copy under AES.
+    coder: Option<Vec<u8>>,
+    aes: Option<Vec<u8>>,
     streams: Vec<(u64, u32)>,
 }
 
-/// A finished folder: its coder record, sizes and file streams.
+/// A finished folder: a chain of coders (each feeding the one before it), the
+/// unpacked size of each coder's output, the packed size and the file streams.
 struct ClosedFolder {
-    coder: Vec<u8>,
+    coders: Vec<Vec<u8>>,
+    unpack_sizes: Vec<u64>,
     packed: u64,
     streams: Vec<(u64, u32)>,
+}
+
+impl ClosedFolder {
+    /// Assembles a folder from its compression coder (if any) and AES coder (if any).
+    fn new(
+        coder: Option<Vec<u8>>,
+        aes: Option<Vec<u8>>,
+        packed: u64,
+        compressed: Option<u64>,
+        streams: Vec<(u64, u32)>,
+    ) -> Self {
+        let total = streams.iter().map(|(size, _)| size).sum();
+        let mut coders = Vec::new();
+        let mut unpack_sizes = Vec::new();
+        if let Some(coder) = coder {
+            coders.push(coder);
+            unpack_sizes.push(total);
+        }
+        if let Some(aes) = aes {
+            coders.push(aes);
+            unpack_sizes.push(if coders.len() == 1 {
+                total
+            } else {
+                compressed.unwrap_or(packed)
+            });
+        }
+        Self {
+            coders,
+            unpack_sizes,
+            packed,
+            streams,
+        }
+    }
+}
+
+/// The 7zAES coder record for `params`.
+fn aes_coder(params: &AesParams) -> Vec<u8> {
+    let props = params.encode();
+    let mut coder = vec![0x24];
+    coder.extend_from_slice(AES);
+    coder.push(u8::try_from(props.len()).unwrap_or(0));
+    coder.extend_from_slice(&props);
+    coder
 }
 
 struct FileRecord {
@@ -123,6 +230,8 @@ pub struct SevenZWriter<W: Write + Seek> {
     folders: Vec<ClosedFolder>,
     files: Vec<FileRecord>,
     options: SevenZOptions,
+    /// Key derived once per archive (no salt), so every folder shares it.
+    key: Option<Key>,
 }
 
 fn missing_sink() -> io::Error {
@@ -137,6 +246,13 @@ impl<W: Write + Seek> SevenZWriter<W> {
     pub fn new(mut out: W, options: SevenZOptions) -> io::Result<Self> {
         let start = out.stream_position()?;
         out.write_all(&[0u8; 32])?;
+        let key = match &options.password {
+            Some(password) => {
+                let params = AesParams::generate(DEFAULT_CYCLES_POWER)?;
+                Some(derive_key(password, &params))
+            }
+            None => None,
+        };
         Ok(Self {
             out: Some(out),
             start,
@@ -144,7 +260,19 @@ impl<W: Write + Seek> SevenZWriter<W> {
             folders: Vec::new(),
             files: Vec::new(),
             options,
+            key,
         })
+    }
+
+    /// Fresh AES parameters (a new IV) and the archive key, when encrypting.
+    fn crypto(&self) -> io::Result<Option<(Key, AesParams)>> {
+        match &self.key {
+            Some(key) => Ok(Some((
+                key.clone(),
+                AesParams::generate(DEFAULT_CYCLES_POWER)?,
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// Number of items written so far.
@@ -206,24 +334,25 @@ impl<W: Write + Seek> SevenZWriter<W> {
 
     fn open_folder(&mut self) -> io::Result<&mut OpenFolder<W>> {
         if self.open.is_none() {
+            let crypto = self.crypto()?;
             let out = self.out.take().ok_or_else(missing_sink)?;
-            let sink = Counting {
-                inner: out,
-                count: 0,
-            };
+            let sink = Sink::new(out, crypto.as_ref());
+            let aes = crypto.as_ref().map(|(_, params)| aes_coder(params));
             let (encoder, coder) = if self.options.level == 0 {
-                (Encoder::Copy(sink), vec![0x01, 0x00])
+                let copy = aes.is_none().then(|| vec![0x01, 0x00]);
+                (Encoder::Copy(sink), copy)
             } else {
                 let options = Lzma2Options::with_preset(self.options.level.min(9));
                 let code = lzma2_code(options.lzma_options.dict_size);
                 (
                     Encoder::Lzma2(Box::new(Lzma2Writer::new(sink, options))),
-                    vec![0x21, 0x21, 0x01, code],
+                    Some(vec![0x21, 0x21, 0x01, code]),
                 )
             };
             self.open = Some(OpenFolder {
                 encoder,
                 coder,
+                aes,
                 streams: Vec::new(),
             });
         }
@@ -232,13 +361,15 @@ impl<W: Write + Seek> SevenZWriter<W> {
 
     fn close_folder(&mut self) -> io::Result<()> {
         if let Some(folder) = self.open.take() {
-            let sink = folder.encoder.finish()?;
-            self.folders.push(ClosedFolder {
-                coder: folder.coder,
-                packed: sink.count,
-                streams: folder.streams,
-            });
-            self.out = Some(sink.inner);
+            let (out, packed, compressed) = folder.encoder.finish()?.finish()?;
+            self.folders.push(ClosedFolder::new(
+                folder.coder,
+                folder.aes,
+                packed,
+                compressed,
+                folder.streams,
+            ));
+            self.out = Some(out);
         }
         Ok(())
     }
@@ -264,27 +395,25 @@ impl<W: Write + Seek> SevenZWriter<W> {
         }
         header.push(K_END);
 
-        if self.options.compress_header {
+        let encrypt_header = self.options.encrypt_header && self.key.is_some();
+        if self.options.compress_header || encrypt_header {
+            let crypto = if encrypt_header { self.crypto()? } else { None };
             let mut options = LzmaOptions::with_preset(5);
             options.dict_size = HEADER_DICTIONARY;
-            let mut encoder = LzmaWriter::new_no_header(
-                Counting {
-                    inner: &mut out,
-                    count: 0,
-                },
-                &options,
-                false,
-            )?;
+            let mut encoder =
+                LzmaWriter::new_no_header(Sink::new(&mut out, crypto.as_ref()), &options, false)?;
             let props = encoder.props();
             encoder.write_all(&header)?;
-            let packed = encoder.finish()?.count;
+            let (_, packed, compressed) = encoder.finish()?.finish()?;
             let mut coder = vec![0x23, 0x03, 0x01, 0x01, 0x05, props];
             coder.extend_from_slice(&HEADER_DICTIONARY.to_le_bytes());
-            let folder = ClosedFolder {
-                coder,
+            let folder = ClosedFolder::new(
+                Some(coder),
+                crypto.as_ref().map(|(_, params)| aes_coder(params)),
                 packed,
-                streams: vec![(header.len() as u64, Crc32::checksum(&header))],
-            };
+                compressed,
+                vec![(header.len() as u64, Crc32::checksum(&header))],
+            );
             let mut wrapper = vec![K_ENCODED_HEADER];
             write_streams_info(&mut wrapper, packed_total, std::slice::from_ref(&folder));
             header = wrapper;
@@ -423,12 +552,22 @@ fn write_streams_info(buf: &mut Vec<u8>, pack_pos: u64, folders: &[ClosedFolder]
     put_count(buf, folders.len());
     buf.push(0);
     for folder in folders {
-        buf.push(1);
-        buf.extend_from_slice(&folder.coder);
+        put_count(buf, folder.coders.len());
+        for coder in &folder.coders {
+            buf.extend_from_slice(coder);
+        }
+        // Coder i reads the output of coder i + 1; the last one reads the pack
+        // stream, which is implied when there is only one.
+        for i in 1..folder.coders.len() {
+            put_count(buf, i - 1);
+            put_count(buf, i);
+        }
     }
     buf.push(K_CODERS_UNPACK_SIZE);
     for folder in folders {
-        put_number(buf, folder.streams.iter().map(|(size, _)| size).sum());
+        for &size in &folder.unpack_sizes {
+            put_number(buf, size);
+        }
     }
     buf.push(K_END);
 

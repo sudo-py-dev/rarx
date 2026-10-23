@@ -1,5 +1,7 @@
 use std::io::{Read, Seek};
 
+use rarx_crypto::Password;
+
 use crate::stream::StreamCodec;
 use crate::tar::{StreamReader, TarReader};
 use crate::{Entry, FormatError, FormatId};
@@ -29,10 +31,17 @@ pub trait ArchiveReader: Send {
     /// [`FormatError`] if the item cannot be located, uses an unsupported method,
     /// or is encrypted.
     fn open_entry(&mut self, index: usize) -> Result<Box<dyn Read + '_>, FormatError>;
+
+    /// Sets the password used for encrypted items from now on. Formats without
+    /// encryption ignore it.
+    fn set_password(&mut self, password: Option<Password>) {
+        let _ = password;
+    }
 }
 
 /// Opens `src` as an archive of the given format. `name_hint` names the single item
-/// of a plain compressed stream (e.g. `notes.txt` for `notes.txt.gz`).
+/// of a plain compressed stream (e.g. `notes.txt` for `notes.txt.gz`). `password`
+/// decrypts encrypted headers and items.
 ///
 /// # Errors
 /// [`FormatError::Unsupported`] if RarX cannot read that format yet, or any error
@@ -41,6 +50,7 @@ pub fn open(
     format: FormatId,
     mut src: Box<dyn ReadSeek>,
     name_hint: &str,
+    password: Option<Password>,
 ) -> Result<Box<dyn ArchiveReader>, FormatError> {
     if let Some(codec) = StreamCodec::from_format(format) {
         return Ok(if crate::tar::starts_with_tar(&mut src, codec)? {
@@ -50,8 +60,12 @@ pub fn open(
         });
     }
     match format {
-        FormatId::Zip => Ok(Box::new(crate::zip::ZipReader::new(src)?)),
-        FormatId::SevenZip => Ok(Box::new(crate::sevenz::SevenZReader::new(src)?)),
+        FormatId::Zip => {
+            let mut reader = crate::zip::ZipReader::new(src)?;
+            reader.set_password(password);
+            Ok(Box::new(reader))
+        }
+        FormatId::SevenZip => Ok(Box::new(crate::sevenz::SevenZReader::new(src, password)?)),
         FormatId::Tar => Ok(Box::new(TarReader::new(src, None)?)),
         other => Err(FormatError::Unsupported(format!(
             "reading {} archives",

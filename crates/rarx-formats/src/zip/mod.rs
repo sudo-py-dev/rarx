@@ -12,13 +12,17 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use flate2::bufread::DeflateDecoder;
 use rarx_checksum::{Checksum, Crc32};
+use rarx_crypto::winzip::{self, AuthenticationFailed, Strength};
+use rarx_crypto::{Password, WrongPassword, zipcrypto};
 use rarx_io::Cursor;
 
 use crate::verify::VerifyReader;
-use crate::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, ReadSeek};
+use crate::{
+    ArchiveReader, DataError, Entry, EntryKind, FileTime, FormatError, FormatId, ReadSeek,
+};
 
 pub use crate::NewItem;
-pub use writer::{ZipMethod, ZipWriter};
+pub use writer::{ZipEncryption, ZipMethod, ZipWriter};
 
 const LOCAL_SIG: u32 = 0x0403_4B50;
 const CENTRAL_SIG: u32 = 0x0201_4B50;
@@ -34,6 +38,7 @@ const MAX_COMMENT_LEN: u64 = 0xFFFF;
 
 const FLAG_ENCRYPTED: u16 = 1 << 0;
 const FLAG_DATA_DESCRIPTOR: u16 = 1 << 3;
+const FLAG_STRONG_ENCRYPTION: u16 = 1 << 6;
 const FLAG_UTF8: u16 = 1 << 11;
 
 const HOST_UNIX: u8 = 3;
@@ -46,6 +51,10 @@ const S_IFLNK: u32 = 0o120_000;
 
 const METHOD_STORE: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
+const METHOD_AES: u16 = 99;
+const AES_EXTRA_ID: u16 = 0x9901;
+/// AE-2 items store no CRC; the authentication code protects them instead.
+const AE_2: u16 = 2;
 
 /// Central-directory fields of an item, kept verbatim so it can be copied into a
 /// new archive without recompressing.
@@ -87,6 +96,7 @@ pub struct ZipReader {
     entries: Vec<Entry>,
     locations: Vec<Location>,
     comment: Option<String>,
+    password: Option<Password>,
 }
 
 impl ZipReader {
@@ -124,6 +134,7 @@ impl ZipReader {
             entries,
             locations,
             comment: dir.comment,
+            password: None,
         })
     }
 
@@ -188,13 +199,50 @@ impl ArchiveReader for ZipReader {
             .ok_or_else(|| corrupt("no such item"))?;
         let (size, packed) = (entry.size, entry.packed_size);
         let header = &self.locations[index].header;
-        let (method, flags, crc32) = (header.method, header.flags, header.crc32);
-        if flags & FLAG_ENCRYPTED != 0 {
-            return Err(FormatError::Encrypted);
+        let (mut method, flags, mut crc32) = (header.method, header.flags, Some(header.crc32));
+        let check_byte = if flags & FLAG_DATA_DESCRIPTOR != 0 {
+            header.dos_time.to_be_bytes()[0]
+        } else {
+            header.crc32.to_be_bytes()[0]
+        };
+        let aes = (method == METHOD_AES)
+            .then(|| aes_extra(&header.extra))
+            .flatten();
+        if method == METHOD_AES && aes.is_none() {
+            return Err(corrupt("AES item without a valid AES extra field"));
         }
+        let encrypted = flags & FLAG_ENCRYPTED != 0;
+        if encrypted && flags & FLAG_STRONG_ENCRYPTION != 0 {
+            return Err(FormatError::Unsupported(
+                "PKWARE strong encryption".to_owned(),
+            ));
+        }
+        let password = match &self.password {
+            Some(pw) if encrypted => Some(pw.clone()),
+            None if encrypted => return Err(FormatError::Encrypted),
+            _ => None,
+        };
         self.seek_to_data(index)?;
 
-        let raw = (&mut self.src).take(packed);
+        let mut raw: Box<dyn Read + '_> = Box::new((&mut self.src).take(packed));
+        let mut packed = packed;
+        if let Some(password) = password {
+            raw = if let Some(aes) = aes {
+                method = aes.method;
+                if aes.version == AE_2 {
+                    crc32 = None;
+                }
+                let reader = winzip::DecryptReader::new(raw, password.utf8(), aes.strength, packed)
+                    .map_err(password_error)?;
+                packed = packed.saturating_sub(aes.strength.overhead());
+                Box::new(AuthAsChecksum(reader))
+            } else {
+                let reader = zipcrypto::DecryptReader::new(raw, password.utf8(), check_byte)
+                    .map_err(password_error)?;
+                packed = packed.saturating_sub(zipcrypto::HEADER_LEN as u64);
+                Box::new(reader)
+            };
+        }
         let decoded: Box<dyn Read + '_> = match method {
             METHOD_STORE if packed != size => {
                 return Err(corrupt(
@@ -210,7 +258,59 @@ impl ArchiveReader for ZipReader {
                 )));
             }
         };
-        Ok(Box::new(VerifyReader::new(decoded, size, Some(crc32))))
+        Ok(Box::new(VerifyReader::new(decoded, size, crc32)))
+    }
+
+    fn set_password(&mut self, password: Option<Password>) {
+        self.password = password;
+    }
+}
+
+/// Fields of the WinZip AES extra field (`0x9901`).
+#[derive(Clone, Copy, Debug)]
+struct AesExtra {
+    version: u16,
+    strength: Strength,
+    /// The real compression method.
+    method: u16,
+}
+
+fn aes_extra(extra: &[u8]) -> Option<AesExtra> {
+    let (_, data) = extra_fields(extra).find(|&(id, _)| id == AES_EXTRA_ID)?;
+    let mut cur = Cursor::new(data);
+    let version = cur.read_u16_le().ok()?;
+    if cur.read_bytes(2).ok()? != b"AE" {
+        return None;
+    }
+    let strength = Strength::from_code(cur.read_u8().ok()?)?;
+    let method = cur.read_u16_le().ok()?;
+    Some(AesExtra {
+        version,
+        strength,
+        method,
+    })
+}
+
+fn password_error(err: std::io::Error) -> FormatError {
+    if WrongPassword::find(&err) {
+        FormatError::WrongPassword
+    } else {
+        FormatError::Io(err)
+    }
+}
+
+/// Reports a failed AES authentication code like a checksum mismatch.
+struct AuthAsChecksum<R>(R);
+
+impl<R: Read> Read for AuthAsChecksum<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf).map_err(|err| {
+            if AuthenticationFailed::find(&err) {
+                DataError::ChecksumMismatch.into()
+            } else {
+                err
+            }
+        })
     }
 }
 
@@ -408,8 +508,12 @@ fn parse_central_header(cur: &mut Cursor<'_>) -> Result<(Entry, Location), Forma
     entry.created = created;
     entry.accessed = accessed;
     entry.crc32 = Some(crc32);
-    entry.method = method_name(method);
     entry.encrypted = flags & FLAG_ENCRYPTED != 0;
+    let (label, keeps_crc) = method_label(method, extra, entry.encrypted);
+    entry.method = label;
+    if !keeps_crc {
+        entry.crc32 = None;
+    }
     entry.unix_mode = unix_mode;
     entry.dos_attributes = Some(external & 0xFFFF);
     entry.comment = (!raw_comment.is_empty()).then(|| decode_name(raw_comment, flags, host));
@@ -504,6 +608,19 @@ fn decode_name(raw: &[u8], flags: u16, host: u8) -> String {
         return text.to_owned();
     }
     cp437::decode(raw)
+}
+
+/// Method shown to users (e.g. `AES-256 Deflate`), and whether the stored CRC is
+/// meaningful (AE-2 items store none).
+fn method_label(method: u16, extra: &[u8], encrypted: bool) -> (String, bool) {
+    match aes_extra(extra) {
+        Some(aes) if method == METHOD_AES => (
+            format!("AES-{} {}", aes.strength.bits(), method_name(aes.method)),
+            aes.version != AE_2,
+        ),
+        _ if encrypted => (format!("ZipCrypto {}", method_name(method)), true),
+        _ => (method_name(method), true),
+    }
 }
 
 fn method_name(method: u16) -> String {

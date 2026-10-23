@@ -23,10 +23,11 @@ producers are used:
 | `s7r-solid.7z`, `s7r-nonsolid.7z` | sevenz-rust2 | default LZMA2, solid and per-file blocks |
 | `s7r-bcj-lzma2.7z`, `s7r-deflate.7z` | sevenz-rust2 | BCJ + LZMA2, Deflate |
 | `s7r-aes.7z` | sevenz-rust2 | AES-256 with encrypted header (password `secret`) |
-| `s7r-ppmd.7z` | sevenz-rust2 | PPMd (unsupported for now) |
+| `s7r-ppmd.7z` | sevenz-rust2 | PPMd H |
 
-`sevenz-verify.rs` is the `main.rs` of a second throwaway crate (same dependency) that
-extracts an archive with `sevenz-rust2`, used to check archives written by RarX.
+`sevenz-verify.rs` is the `main.rs` of a second throwaway crate (same dependency;
+its default `aes256` feature is used) that extracts an archive with `sevenz-rust2`, optionally with a
+password, used to check archives written by RarX.
 
 Still wanted: archives from real 7-Zip (BCJ2, ARM64, multi-volume, SFX, `-mhc=off`,
 `-mtc=on`, anti-items).

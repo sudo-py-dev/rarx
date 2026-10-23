@@ -344,3 +344,78 @@ fn tar_family_through_both_clis() {
     );
     assert_eq!(code(&mismatch), Some(2));
 }
+
+#[test]
+fn passwords_on_the_command_line_and_prompted() {
+    let encrypted = zip("infozip-encrypted.zip");
+    // Given with -p, typed at the prompt, wrong, and refused with -p-.
+    assert_eq!(
+        code(&run(RARX, &["t", "-psecret", arg(&encrypted)], "")),
+        Some(0)
+    );
+    assert_eq!(
+        code(&run(RARX, &["t", arg(&encrypted)], "secret\n")),
+        Some(0)
+    );
+    assert_eq!(
+        code(&run(RARX, &["t", "-pwrong", arg(&encrypted)], "")),
+        Some(11)
+    );
+    assert_eq!(
+        code(&run(RARX, &["t", "-p-", arg(&encrypted)], "secret\n")),
+        Some(11)
+    );
+    assert_eq!(
+        code(&run(RX7, &["t", "-psecret", arg(&encrypted)], "")),
+        Some(0)
+    );
+    let wrong = run(RX7, &["t", "-pwrong", arg(&encrypted)], "");
+    assert_eq!(code(&wrong), Some(2));
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("Wrong password"));
+
+    let s7r = corpus_file("7z/s7r-aes.7z");
+    assert_eq!(code(&run(RX7, &["l", arg(&s7r)], "secret\n")), Some(0));
+    let refused = run(RX7, &["l", "-pnope", arg(&s7r)], "");
+    assert_eq!(code(&refused), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("Wrong password?"));
+    assert_eq!(code(&run(RARX, &["l", "-pnope", arg(&s7r)], "")), Some(11));
+}
+
+#[test]
+fn creating_encrypted_archives() {
+    let tmp = TempDir::new("cli-enc");
+    let src = sample_tree(tmp.path());
+    let cases: [(&str, &str, &[&str]); 4] = [
+        (RX7, "7z", &["a", "-pk3y", "-mhe=on"]),
+        (RX7, "zip", &["a", "-tzip", "-pk3y", "-mem=AES256"]),
+        (RX7, "zip", &["a", "-tzip", "-pk3y"]),
+        (RARX, "zip", &["a", "-ep1", "-hpk3y"]),
+    ];
+    for (i, (bin, ext, switches)) in cases.into_iter().enumerate() {
+        let archive = tmp.path().join(format!("e{i}.{ext}"));
+        let mut args = switches.to_vec();
+        args.extend([arg(&archive), arg(&src)]);
+        assert_eq!(code(&run(bin, &args, "")), Some(0), "{switches:?}");
+        let out = tmp.path().join(format!("out{i}"));
+        let o = format!("-o{}", out.display());
+        let extracted = run(RX7, &["x", "-pk3y", "-y", &o, arg(&archive)], "");
+        assert_eq!(code(&extracted), Some(0), "{switches:?}");
+        assert_eq!(
+            std::fs::read(out.join("src/a.txt")).unwrap(),
+            std::fs::read(src.join("a.txt")).unwrap()
+        );
+        let technical = stdout(&run(RX7, &["l", "-slt", "-pk3y", arg(&archive)], ""));
+        assert!(technical.contains("Encrypted = +"), "{switches:?}");
+    }
+    // -mhe without a password, and a password for TAR, are refused.
+    let bad = tmp.path().join("bad.7z");
+    assert_eq!(
+        code(&run(RX7, &["a", "-mhe", arg(&bad), arg(&src)], "")),
+        Some(7)
+    );
+    let tar = tmp.path().join("bad.tar");
+    assert_eq!(
+        code(&run(RX7, &["a", "-pk", arg(&tar), arg(&src)], "")),
+        Some(2)
+    );
+}

@@ -9,10 +9,13 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use rarx_checksum::{Checksum, Crc32};
+use rarx_crypto::winzip::{self, Strength};
+use rarx_crypto::{Password, zipcrypto};
 
 use super::{
-    CENTRAL_SIG, EOCD_SIG, FLAG_DATA_DESCRIPTOR, FLAG_UTF8, LOCAL_SIG, METHOD_DEFLATE,
-    METHOD_STORE, RawHeader, ZIP64_EOCD_SIG, ZIP64_LOCATOR_SIG,
+    AE_2, AES_EXTRA_ID, CENTRAL_SIG, EOCD_SIG, FLAG_DATA_DESCRIPTOR, FLAG_ENCRYPTED, FLAG_UTF8,
+    LOCAL_SIG, METHOD_AES, METHOD_DEFLATE, METHOD_STORE, RawHeader, ZIP64_EOCD_SIG,
+    ZIP64_LOCATOR_SIG,
 };
 use crate::{CivilTime, EntryKind, FileTime, NewItem};
 
@@ -20,6 +23,11 @@ const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4B50;
 const MADE_BY_VERSION: u16 = 63;
 const NEEDS_DEFAULT: u16 = 20;
 const NEEDS_ZIP64: u16 = 45;
+const NEEDS_AES: u16 = 51;
+/// WinZip writes AE-1 (CRC kept) unless the file is this small, where the CRC
+/// would reveal too much about the contents.
+const AE_2_BELOW: u64 = 20;
+const AE_1: u16 = 1;
 const HOST_DOS: u16 = 0;
 const HOST_UNIX: u16 = 3;
 const DOS_DIRECTORY: u32 = 0x10;
@@ -47,6 +55,115 @@ pub enum ZipMethod {
     },
 }
 
+/// Encryption for new ZIP items.
+#[derive(Clone, Debug)]
+pub enum ZipEncryption {
+    /// Legacy PKWARE encryption. Weak; for old unzip tools only.
+    ZipCrypto(Password),
+    /// WinZip AES-256 (AE-1, or AE-2 for files under 20 bytes).
+    Aes256(Password),
+}
+
+impl ZipEncryption {
+    fn password(&self) -> &[u8] {
+        match self {
+            Self::ZipCrypto(pw) | Self::Aes256(pw) => pw.utf8(),
+        }
+    }
+
+    /// Bytes the scheme adds to each item's data.
+    fn overhead(&self) -> u64 {
+        match self {
+            Self::ZipCrypto(_) => zipcrypto::HEADER_LEN as u64,
+            Self::Aes256(_) => Strength::Aes256.overhead(),
+        }
+    }
+
+    /// Marks `header` as encrypted (the AES version is settled by [`settle_aes`]).
+    fn protect(&self, header: &mut RawHeader) {
+        header.flags |= FLAG_ENCRYPTED;
+        if let Self::Aes256(_) = self {
+            let real_method = header.method;
+            header.method = METHOD_AES;
+            header.needed = header.needed.max(NEEDS_AES);
+            put_u16(&mut header.extra, AES_EXTRA_ID);
+            put_u16(&mut header.extra, 7);
+            put_u16(&mut header.extra, AE_1);
+            header.extra.extend_from_slice(b"AE");
+            header.extra.push(Strength::Aes256.code());
+            put_u16(&mut header.extra, real_method);
+        }
+    }
+}
+
+/// Picks AE-1 or AE-2 for an AES item of `size` bytes whose CRC is already set.
+fn settle_aes(header: &mut RawHeader, size: u64) {
+    if header.method != METHOD_AES || size >= AE_2_BELOW {
+        return;
+    }
+    header.crc32 = 0;
+    let mut at = 0;
+    let mut version_at = None;
+    for (id, data) in super::extra_fields(&header.extra) {
+        if id == AES_EXTRA_ID {
+            version_at = Some(at + 4);
+            break;
+        }
+        at += 4 + data.len();
+    }
+    if let Some(i) = version_at {
+        header.extra[i..i + 2].copy_from_slice(&AE_2.to_le_bytes());
+    }
+}
+
+/// The data sink of one item: plain, or through a cipher.
+enum Seal<'a, W: Write> {
+    Plain(&'a mut W),
+    ZipCrypto(zipcrypto::EncryptWriter<&'a mut W>),
+    Aes(Box<winzip::EncryptWriter<&'a mut W>>),
+}
+
+impl<'a, W: Write> Seal<'a, W> {
+    fn new(out: &'a mut W, encryption: Option<&ZipEncryption>, check: u8) -> io::Result<Self> {
+        Ok(match encryption {
+            None => Self::Plain(out),
+            Some(e @ ZipEncryption::ZipCrypto(_)) => {
+                Self::ZipCrypto(zipcrypto::EncryptWriter::new(out, e.password(), check)?)
+            }
+            Some(e @ ZipEncryption::Aes256(_)) => Self::Aes(Box::new(winzip::EncryptWriter::new(
+                out,
+                e.password(),
+                Strength::Aes256,
+            )?)),
+        })
+    }
+
+    fn finish(self) -> io::Result<()> {
+        match self {
+            Self::Plain(_) | Self::ZipCrypto(_) => Ok(()),
+            Self::Aes(w) => w.finish().map(drop),
+        }
+    }
+}
+
+impl<W: Write> Write for Seal<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(w) => w.write(buf),
+            Self::ZipCrypto(w) => w.write(buf),
+            Self::Aes(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush(),
+            Self::ZipCrypto(w) => w.flush(),
+            Self::Aes(w) => w.flush(),
+        }
+    }
+}
+
 struct Record {
     header: RawHeader,
     size: u64,
@@ -59,6 +176,7 @@ pub struct ZipWriter<W: Write + Seek> {
     out: W,
     records: Vec<Record>,
     force_zip64: bool,
+    encryption: Option<ZipEncryption>,
 }
 
 impl<W: Write + Seek> ZipWriter<W> {
@@ -68,7 +186,13 @@ impl<W: Write + Seek> ZipWriter<W> {
             out,
             records: Vec::new(),
             force_zip64: false,
+            encryption: None,
         }
+    }
+
+    /// Encrypts items added from now on (directories are never encrypted).
+    pub fn set_encryption(&mut self, encryption: Option<ZipEncryption>) {
+        self.encryption = encryption;
     }
 
     /// Writes ZIP64 fields and end records even when not required (for testing
@@ -109,24 +233,36 @@ impl<W: Write + Seek> ZipWriter<W> {
         let zip64_local = self.force_zip64 || item.size_hint >= ZIP64_LOCAL_THRESHOLD;
         let compression = level.map_or(METHOD_STORE, |_| METHOD_DEFLATE);
         let mut header = new_header(item, compression, level);
+        if let Some(encryption) = &self.encryption {
+            encryption.protect(&mut header);
+            if let ZipEncryption::ZipCrypto(_) = encryption {
+                // The CRC is unknown until the end, so the check byte comes from
+                // the time, which readers expect only together with a descriptor.
+                header.flags |= FLAG_DATA_DESCRIPTOR;
+            }
+        }
         let local_offset = self.out.stream_position()?;
         self.write_local(&header, 0, 0, zip64_local)?;
         let data_start = self.out.stream_position()?;
 
         let mut source = CrcReader::new(data);
+        let check = header.dos_time.to_be_bytes()[0];
+        let mut sink = Seal::new(&mut self.out, self.encryption.as_ref(), check)?;
         match level {
             Some(level) => {
-                let mut encoder = DeflateEncoder::new(&mut self.out, Compression::new(level));
+                let mut encoder = DeflateEncoder::new(&mut sink, Compression::new(level));
                 io::copy(&mut source, &mut encoder)?;
                 encoder.finish()?;
             }
             None => {
-                io::copy(&mut source, &mut self.out)?;
+                io::copy(&mut source, &mut sink)?;
             }
         }
+        sink.finish()?;
         let data_end = self.out.stream_position()?;
         let (size, packed) = (source.count, data_end - data_start);
         header.crc32 = source.crc.finalize();
+        settle_aes(&mut header, size);
         if !zip64_local && (size >= MAX_32 || packed >= MAX_32) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -136,6 +272,9 @@ impl<W: Write + Seek> ZipWriter<W> {
         self.out.seek(SeekFrom::Start(local_offset))?;
         self.write_local(&header, size, packed, zip64_local)?;
         self.out.seek(SeekFrom::Start(data_end))?;
+        if header.flags & FLAG_DATA_DESCRIPTOR != 0 {
+            self.write_descriptor(header.crc32, size, packed, zip64_local)?;
+        }
         self.records.push(Record {
             header,
             size,
@@ -171,7 +310,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         let mut header = new_header(item, method, level);
         header.crc32 = Crc32::checksum(&raw);
         let (size, packed) = (raw.len() as u64, payload.len() as u64);
-        self.write_item(header, size, packed, &mut &payload[..])
+        self.write_item(header, size, packed, &mut &payload[..], true)
     }
 
     /// Adds a directory entry.
@@ -181,7 +320,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     pub fn add_directory(&mut self, item: &NewItem) -> io::Result<()> {
         let mut header = new_header(item, METHOD_STORE, None);
         header.needed = NEEDS_DEFAULT;
-        self.write_item(header, 0, 0, &mut io::empty())
+        self.write_item(header, 0, 0, &mut io::empty(), false)
     }
 
     /// Adds a symbolic link pointing to `target`.
@@ -192,7 +331,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         let mut header = new_header(item, METHOD_STORE, None);
         header.crc32 = Crc32::checksum(target.as_bytes());
         let len = target.len() as u64;
-        self.write_item(header, len, len, &mut target.as_bytes())
+        self.write_item(header, len, len, &mut target.as_bytes(), true)
     }
 
     /// Copies an item whose compressed bytes and header come from another archive.
@@ -217,17 +356,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             ));
         }
         if descriptor {
-            let mut buf = Vec::with_capacity(24);
-            put_u32(&mut buf, DATA_DESCRIPTOR_SIG);
-            put_u32(&mut buf, header.crc32);
-            if zip64 {
-                put_u64(&mut buf, packed);
-                put_u64(&mut buf, size);
-            } else {
-                put_u32(&mut buf, clamp32(packed));
-                put_u32(&mut buf, clamp32(size));
-            }
-            self.out.write_all(&buf)?;
+            self.write_descriptor(header.crc32, size, packed, zip64)?;
         }
         self.records.push(Record {
             header,
@@ -238,16 +367,48 @@ impl<W: Write + Seek> ZipWriter<W> {
         Ok(())
     }
 
-    fn write_item(
+    fn write_descriptor(
         &mut self,
-        header: RawHeader,
+        crc: u32,
         size: u64,
         packed: u64,
-        data: &mut dyn Read,
+        zip64: bool,
     ) -> io::Result<()> {
+        let mut buf = Vec::with_capacity(24);
+        put_u32(&mut buf, DATA_DESCRIPTOR_SIG);
+        put_u32(&mut buf, crc);
+        if zip64 {
+            put_u64(&mut buf, packed);
+            put_u64(&mut buf, size);
+        } else {
+            put_u32(&mut buf, clamp32(packed));
+            put_u32(&mut buf, clamp32(size));
+        }
+        self.out.write_all(&buf)
+    }
+
+    /// Writes an item whose (unencrypted) payload size is known up front,
+    /// encrypting it when `encrypt` is set and encryption is on.
+    fn write_item(
+        &mut self,
+        mut header: RawHeader,
+        size: u64,
+        mut packed: u64,
+        data: &mut dyn Read,
+        encrypt: bool,
+    ) -> io::Result<()> {
+        let encryption = self.encryption.clone().filter(|_| encrypt);
+        if let Some(encryption) = &encryption {
+            encryption.protect(&mut header);
+            packed += encryption.overhead();
+        }
+        let check = header.crc32.to_be_bytes()[0];
+        settle_aes(&mut header, size);
         let local_offset = self.out.stream_position()?;
         self.write_local(&header, size, packed, self.force_zip64)?;
-        io::copy(data, &mut self.out)?;
+        let mut sink = Seal::new(&mut self.out, encryption.as_ref(), check)?;
+        io::copy(data, &mut sink)?;
+        sink.finish()?;
         self.records.push(Record {
             header,
             size,

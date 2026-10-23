@@ -17,7 +17,15 @@ Implemented in `crates/rarx-formats/src/zip/` (`mod.rs` reader, `writer.rs` writ
 - Kind: Unix mode `S_IFLNK`/`S_IFDIR` for Unix/macOS hosts, else trailing `/` or DOS
   directory attribute.
 - Methods: Store, Deflate. Others are listed by name and reported as unsupported.
-- Not yet: multi-volume/split ZIP, encryption, Deflate64/BZip2/LZMA/Zstd/XZ/PPMd.
+- ZipCrypto: 12-byte header checked against the CRC's high byte (the DOS time's high
+  byte when bit 3 is set); 1 wrong password in 256 passes and then fails the CRC,
+  which is reported as "wrong password".
+- WinZip AES (method 99, extra `0x9901`): AES-128/192/256, PBKDF2-HMAC-SHA1 (1000
+  rounds), little-endian CTR from 1, 2-byte verifier, 10-byte HMAC-SHA1 checked at
+  the end of the item (a mismatch reads as a CRC error). AE-2 items carry no CRC.
+  Listed as e.g. `AES-256 Deflate` / `ZipCrypto Deflate`.
+- PKWARE strong encryption (flag bit 6) is reported as unsupported.
+- Not yet: multi-volume/split ZIP, Deflate64/BZip2/LZMA/Zstd/XZ/PPMd.
 
 ## Writing
 
@@ -34,5 +42,12 @@ Implemented in `crates/rarx-formats/src/zip/` (`mod.rs` reader, `writer.rs` writ
   encrypted ones, rebuilding only the ZIP64 field and any data descriptor.
 - Engine (`rarx-core/src/update.rs`) writes to a hidden temp file next to the target and
   renames it into place only on success.
-- Not yet: Deflate64/BZip2/LZMA/Zstd/PPMd methods, encryption, comments, split archives,
+- Encryption (`ZipWriter::set_encryption`): every item except folders.
+  - AES-256: method 99 with the `0x9901` extra; AE-1 (CRC kept) unless the file is
+    under 20 bytes, then AE-2 (CRC zeroed), as WinZip does. Needs version 5.1.
+  - ZipCrypto: buffered items use the CRC check byte; streamed (> 4 MiB) items set
+    bit 3, use the DOS-time check byte and append a data descriptor.
+  - Cross-checked with the `zip` crate in both directions (AES-128/256, AE-1/AE-2,
+    ZipCrypto) and with Info-ZIP `unzip -P` for ZipCrypto.
+- Not yet: Deflate64/BZip2/LZMA/Zstd/PPMd methods, comments, split archives,
   7-Zip-grade optimal Deflate (we use zlib-rs levels).

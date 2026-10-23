@@ -6,14 +6,14 @@ use std::process::ExitCode;
 
 use rarx_core::select::Selection;
 use rarx_core::{
-    AddOptions, Archive, Entry, EntryKind, Error, ExtractHandler, ExtractOptions, ItemAction,
-    ItemError, JobControl, Outcome, OverwriteChoice, OverwriteMode, PathMode, Report, StorePaths,
-    UpdateHandler, UpdateMode, add, delete, extract, test,
+    AddOptions, Archive, Entry, EntryKind, Error, ExtractHandler, ExtractOptions, FormatError,
+    ItemAction, ItemError, JobControl, Outcome, OverwriteChoice, OverwriteMode, PathMode, Report,
+    StorePaths, UpdateHandler, UpdateMode, ZipCipher, add, delete, extract, test,
 };
 
 use crate::common::{
-    Args, ask, display_name, dos_attribute_string, file_size, has_error, time_or_blank,
-    unix_mode_string,
+    Args, PasswordArg, ask, display_name, dos_attribute_string, ensure_item_password, file_size,
+    has_error, open_archive, time_or_blank, unix_mode_string,
 };
 use crate::exit::Rar as Exit;
 
@@ -40,6 +40,7 @@ Usage:     rarx <command> -<switch 1> -<switch N> <archive> <files...>
   ep            Exclude paths from names
   ep1           Exclude base directory from names
   ep2           Expand paths to full
+  hp[password]  Encrypt both file data and headers
   idq           Disable messages, except errors
   inul          Disable all messages
   kb            Keep broken extracted files
@@ -49,6 +50,8 @@ Usage:     rarx <command> -<switch 1> -<switch N> <archive> <files...>
   ol            Save symbolic links as the link instead of the file
   op<path>      Set the output path for extracted files
   or            Rename files automatically
+  p[password]   Set password
+  p-            Do not query password
   r             Recurse subdirectories (accepted; masks always match at any depth)
   x<file>       Exclude specified file
   y             Assume Yes on all queries";
@@ -70,6 +73,8 @@ struct Options {
     paths: StorePaths,
     store_symlinks: bool,
     delete_sources: bool,
+    password: PasswordArg,
+    encrypt_header: bool,
     /// Arguments after the archive name: files to add, or masks to extract.
     files: Vec<String>,
 }
@@ -100,30 +105,31 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     let command = args.command.as_str();
-    let result = match command {
-        "l" | "lt" | "lta" | "lb" | "v" | "vt" | "vta" | "vb" => {
-            open(path).map(|mut a| list(&mut a, command, &options))
-        }
-        "t" => open(path).map(|mut a| run_test(&mut a, &options)),
-        "x" if !options.exclude_paths => {
-            open(path).map(|mut a| run_extract(&mut a, &options, PathMode::Full))
-        }
-        "x" | "e" => open(path).map(|mut a| run_extract(&mut a, &options, PathMode::None)),
-        "p" => open(path).map(|mut a| print_files(&mut a, &options)),
-        "a" => return run_add(path, &options, UpdateMode::Add, false),
-        "u" => return run_add(path, &options, UpdateMode::Update, false),
-        "f" => return run_add(path, &options, UpdateMode::Freshen, false),
-        "m" | "mf" => return run_add(path, &options, UpdateMode::Add, true),
-        "d" => return run_delete(path, &options),
-        "c" | "ch" | "cw" | "i" | "k" | "r" | "rc" | "rn" | "rr" | "rv" | "s" => {
-            eprintln!("Command `{command}` is not implemented yet");
-            return Exit::UserError.into();
-        }
-        other => {
-            eprintln!("ERROR: Unknown command: {other}");
-            return Exit::UserError.into();
-        }
-    };
+    let result =
+        match command {
+            "l" | "lt" | "lta" | "lb" | "v" | "vt" | "vta" | "vb" => {
+                open(path, &options, false).map(|mut a| list(&mut a, command, &options))
+            }
+            "t" => open(path, &options, true).map(|mut a| run_test(&mut a, &options)),
+            "x" if !options.exclude_paths => open(path, &options, true)
+                .map(|mut a| run_extract(&mut a, &options, PathMode::Full)),
+            "x" | "e" => open(path, &options, true)
+                .map(|mut a| run_extract(&mut a, &options, PathMode::None)),
+            "p" => open(path, &options, true).map(|mut a| print_files(&mut a, &options)),
+            "a" => return run_add(path, &options, UpdateMode::Add, false),
+            "u" => return run_add(path, &options, UpdateMode::Update, false),
+            "f" => return run_add(path, &options, UpdateMode::Freshen, false),
+            "m" | "mf" => return run_add(path, &options, UpdateMode::Add, true),
+            "d" => return run_delete(path, &options),
+            "c" | "ch" | "cw" | "i" | "k" | "r" | "rc" | "rn" | "rr" | "rv" | "s" => {
+                eprintln!("Command `{command}` is not implemented yet");
+                return Exit::UserError.into();
+            }
+            other => {
+                eprintln!("ERROR: Unknown command: {other}");
+                return Exit::UserError.into();
+            }
+        };
     result.unwrap_or_else(|code| code)
 }
 
@@ -142,6 +148,8 @@ fn parse(args: &Args) -> Result<(Options, String), String> {
         paths: StorePaths::AsGiven,
         store_symlinks: false,
         delete_sources: false,
+        password: PasswordArg::Unset,
+        encrypt_header: false,
         files: Vec::new(),
     };
     for switch in &args.switches {
@@ -181,8 +189,12 @@ fn parse(args: &Args) -> Result<(Options, String), String> {
             _ if lower.starts_with('n') && lower.len() > 1 => {
                 options.selection = options.selection.include(&switch[1..]);
             }
-            _ if lower.starts_with('p') || lower.starts_with("hp") => {
-                return Err("Passwords are not supported yet".to_owned());
+            _ if lower.starts_with("hp") => {
+                options.password = PasswordArg::from_switch(&switch[2..]);
+                options.encrypt_header = true;
+            }
+            _ if lower.starts_with('p') => {
+                options.password = PasswordArg::from_switch(&switch[1..]);
             }
             _ => return Err(format!("ERROR: Unknown option: {switch}")),
         }
@@ -252,6 +264,13 @@ fn run_add(path: &Path, options: &Options, mode: UpdateMode, move_files: bool) -
         return Exit::UserError.into();
     }
     let quiet = options.quiet || options.silent;
+    let password = match options.password.initial(true) {
+        Ok(password) => password,
+        Err(message) => {
+            eprintln!("ERROR: {message}");
+            return Exit::UserError.into();
+        }
+    };
     if !options.silent {
         let verb = if path.exists() {
             "Updating"
@@ -271,6 +290,9 @@ fn run_add(path: &Path, options: &Options, mode: UpdateMode, move_files: bool) -
         solid: true,
         compress_header: true,
         force_zip64: false,
+        password,
+        encrypt_header: options.encrypt_header,
+        zip_cipher: ZipCipher::Aes256,
     };
     let mut console = UpdateConsole { quiet };
     match add(
@@ -316,12 +338,20 @@ fn run_delete(path: &Path, options: &Options) -> ExitCode {
     if !options.silent {
         println!("Deleting from {}\n", path.display());
     }
+    let password = match options.password.initial(false) {
+        Ok(password) => password,
+        Err(message) => {
+            eprintln!("ERROR: {message}");
+            return Exit::UserError.into();
+        }
+    };
     let mut console = UpdateConsole {
         quiet: options.quiet || options.silent,
     };
     match delete(
         path,
         &options.selection,
+        password,
         &mut console,
         &JobControl::default(),
     ) {
@@ -345,18 +375,38 @@ fn run_delete(path: &Path, options: &Options) -> ExitCode {
     }
 }
 
-fn open(path: &Path) -> Result<Archive, ExitCode> {
+/// Opens the archive, asking for a password when the header (or, with
+/// `reads_data`, any item) is encrypted.
+fn open(path: &Path, options: &Options, reads_data: bool) -> Result<Archive, ExitCode> {
     if !path.exists() {
         eprintln!("Cannot open {}\nNo such file or directory", path.display());
         return Err(Exit::Open.into());
     }
-    Archive::open(path).map_err(|err| {
-        match err {
-            Error::UnknownFormat(_) => eprintln!("{} is not an archive", path.display()),
-            other => eprintln!("{}: {other}", path.display()),
-        }
-        Exit::Fatal.into()
-    })
+    let mut password = options.password.initial(false).map_err(|message| {
+        eprintln!("ERROR: {message}");
+        ExitCode::from(Exit::UserError)
+    })?;
+    let mut archive =
+        open_archive(path, &options.password, &mut password).map_err(|err| -> ExitCode {
+            match err {
+                Error::UnknownFormat(_) => {
+                    eprintln!("{} is not an archive", path.display());
+                    Exit::Fatal.into()
+                }
+                Error::Format(FormatError::Encrypted | FormatError::WrongPassword) => {
+                    eprintln!("The specified password is incorrect.");
+                    Exit::BadPassword.into()
+                }
+                other => {
+                    eprintln!("{}: {other}", path.display());
+                    Exit::Fatal.into()
+                }
+            }
+        })?;
+    if reads_data {
+        ensure_item_password(&mut archive, &options.password, &mut password);
+    }
+    Ok(archive)
 }
 
 fn list(archive: &mut Archive, command: &str, options: &Options) -> ExitCode {
@@ -493,7 +543,8 @@ impl ExtractHandler for Console {
 fn describe(err: &ItemError) -> String {
     match err {
         ItemError::Checksum => "checksum error".to_owned(),
-        ItemError::Encrypted => "encrypted file, passwords are not supported yet".to_owned(),
+        ItemError::Encrypted => "encrypted file, a password is needed (-p)".to_owned(),
+        ItemError::WrongPassword => "incorrect password".to_owned(),
         ItemError::UnsafePath => "unsafe path, skipped".to_owned(),
         ItemError::UnsafeLink(target) => format!("dangerous link to \"{target}\" skipped"),
         other => other.to_string(),
@@ -573,7 +624,9 @@ fn finish(result: rarx_core::Result<Report>, options: &Options) -> ExitCode {
     eprintln!("Total errors: {}", report.errors.len());
     if has_error(&report, |e| *e == ItemError::Checksum) {
         Exit::Crc.into()
-    } else if has_error(&report, |e| *e == ItemError::Encrypted) {
+    } else if has_error(&report, |e| {
+        matches!(e, ItemError::Encrypted | ItemError::WrongPassword)
+    }) {
         Exit::BadPassword.into()
     } else {
         Exit::Fatal.into()

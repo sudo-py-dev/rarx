@@ -1,10 +1,21 @@
 //! Archive encryption for RarX (AGENT.md §8): AES-CBC/CTR, ZipCrypto, the per-format
 //! key-derivation functions, and zeroizing password handling.
 //!
-//! Implementations land in milestone M1 (7z/ZIP) and M2 (RAR).
+//! Every cipher is exposed as a streaming [`std::io::Read`] (decrypt) or
+//! [`std::io::Write`] (encrypt) adapter, so container code only wires streams.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+mod block;
+mod password;
+pub mod sevenz;
+pub mod winzip;
+pub mod zipcrypto;
+
+use std::{fmt, io};
+
+pub use password::Password;
 
 /// Encryption schemes RarX reads or writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,4 +46,54 @@ impl Scheme {
     pub fn can_encrypt(self) -> bool {
         !matches!(self, Self::Rar3Aes128 | Self::Rar20 | Self::Rar15)
     }
+}
+
+/// The password does not match the archive's check value. Carried inside an
+/// [`io::Error`] of kind [`io::ErrorKind::InvalidData`]; use [`WrongPassword::find`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrongPassword;
+
+impl WrongPassword {
+    /// Whether `err` (or the error it wraps) reports a wrong password.
+    #[must_use]
+    pub fn find(err: &io::Error) -> bool {
+        err.get_ref()
+            .is_some_and(|inner| inner.downcast_ref::<Self>().is_some())
+    }
+}
+
+impl fmt::Display for WrongPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("wrong password")
+    }
+}
+
+impl std::error::Error for WrongPassword {}
+
+impl From<WrongPassword> for io::Error {
+    fn from(err: WrongPassword) -> Self {
+        io::Error::new(io::ErrorKind::InvalidData, err)
+    }
+}
+
+/// Fills `buf` with bytes from the operating system's secure random source.
+///
+/// # Errors
+/// If the OS random source is unavailable.
+pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    getrandom::fill(buf).map_err(|err| io::Error::other(format!("random source failed: {err}")))
+}
+
+/// Reads until `buf` is full or the source ends; returns the bytes read.
+fn read_full(src: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match src.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }

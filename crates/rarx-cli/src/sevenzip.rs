@@ -7,13 +7,14 @@ use std::process::ExitCode;
 use rarx_core::select::Selection;
 use rarx_core::time::to_system_time;
 use rarx_core::{
-    AddOptions, Archive, Entry, Error, ExtractHandler, ExtractOptions, ItemError, JobControl,
-    Outcome, OverwriteChoice, OverwriteMode, PathMode, Report, StorePaths, UpdateHandler,
-    UpdateMode, add, delete, extract, test,
+    AddOptions, Archive, Entry, Error, ExtractHandler, ExtractOptions, FormatError, ItemError,
+    JobControl, Outcome, OverwriteChoice, OverwriteMode, PathMode, Report, StorePaths,
+    UpdateHandler, UpdateMode, ZipCipher, add, delete, extract, test,
 };
 
 use crate::common::{
-    Args, ask, display_name, dos_attribute_string, file_size, time_or_blank, unix_mode_string,
+    Args, PasswordArg, ask, display_name, dos_attribute_string, ensure_item_password, file_size,
+    open_archive, time_or_blank, unix_mode_string,
 };
 use crate::exit::SevenZip as Exit;
 
@@ -34,8 +35,10 @@ Usage: rx7 <command> [<switches>...] <archive_name> [<file_names>...]
   -ao{a|s|t|u} : set Overwrite mode
   -i!{wildcard} : Include filenames
   -m{Parameters} : set compression Method (-mx[0-9], -mm=Copy|Deflate|LZMA2,
-                   -ms=on|off solid, -mhc=on|off header compression)
+                   -ms=on|off solid, -mhc=on|off header compression,
+                   -mhe=on|off header encryption, -mem=ZipCrypto|AES256)
   -o{Directory} : set Output directory
+  -p{Password} : set Password
   -r[-] : Recurse subdirectories (accepted; masks always match at any depth)
   -sdel : delete files after compression
   -slt : show technical information for l (List) command
@@ -63,6 +66,9 @@ struct Options {
     store_symlinks: bool,
     delete_sources: bool,
     archive_type: Option<String>,
+    password: PasswordArg,
+    encrypt_header: bool,
+    zip_cipher: ZipCipher,
 }
 
 /// Runs the `rx7` command line.
@@ -90,10 +96,14 @@ pub fn run(args: &[String]) -> ExitCode {
         println!("\nrx7 {} (RarX)\n", env!("CARGO_PKG_VERSION"));
     }
     match args.command.as_str() {
-        "l" => with_archive(path, |a| list(a, &options)),
-        "t" => with_archive(path, |a| run_test(a, &options)),
-        "x" => with_archive(path, |a| run_extract(a, &options, PathMode::Full)),
-        "e" => with_archive(path, |a| run_extract(a, &options, PathMode::None)),
+        "l" => with_archive(path, &options, false, |a| list(a, &options)),
+        "t" => with_archive(path, &options, true, |a| run_test(a, &options)),
+        "x" => with_archive(path, &options, true, |a| {
+            run_extract(a, &options, PathMode::Full)
+        }),
+        "e" => with_archive(path, &options, true, |a| {
+            run_extract(a, &options, PathMode::None)
+        }),
         "a" => run_add(path, &args.positionals[1..], &options, UpdateMode::Add),
         "u" => run_add(path, &args.positionals[1..], &options, UpdateMode::Update),
         "d" => run_delete(path, &args.positionals[1..], &options),
@@ -120,6 +130,10 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
         store_symlinks: false,
         delete_sources: false,
         archive_type: None,
+        password: PasswordArg::Unset,
+        encrypt_header: false,
+        // 7-Zip's default, readable by every unzip tool.
+        zip_cipher: ZipCipher::ZipCrypto,
     };
     for switch in &args.switches {
         let lower = switch.to_lowercase();
@@ -132,6 +146,10 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
             "ms=off" => options.solid = false,
             "mhc" | "mhc=on" => options.compress_header = true,
             "mhc=off" => options.compress_header = false,
+            "mhe" | "mhe=on" => options.encrypt_header = true,
+            "mhe=off" => options.encrypt_header = false,
+            "mem=zipcrypto" => options.zip_cipher = ZipCipher::ZipCrypto,
+            "mem=aes256" | "mem=aes" => options.zip_cipher = ZipCipher::Aes256,
             "sdel" => options.delete_sources = true,
             "snl" => options.store_symlinks = true,
             "mm=copy" | "m0=copy" => options.mx = 0,
@@ -164,7 +182,7 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
                 options.selection = options.selection.include(&switch[2..]);
             }
             _ if lower.starts_with('p') => {
-                return Err("Passwords are not supported yet".to_owned());
+                options.password = PasswordArg::from_switch(&switch[1..]);
             }
             _ => return Err(format!("Unsupported switch: -{switch}")),
         }
@@ -262,6 +280,16 @@ fn run_add(path: &Path, inputs: &[String], options: &Options, mode: UpdateMode) 
     } else {
         "Creating"
     };
+    let password = match options.password.initial(true) {
+        Ok(password) => password,
+        Err(message) => {
+            eprintln!("ERROR: {message}");
+            return Exit::Fatal.into();
+        }
+    };
+    if options.encrypt_header && password.is_none() {
+        return command_line_error("-mhe needs a password (-p)");
+    }
     println!("{verb} archive: {}\n", path.display());
     let add_options = AddOptions {
         level: if is_zip {
@@ -277,6 +305,9 @@ fn run_add(path: &Path, inputs: &[String], options: &Options, mode: UpdateMode) 
         solid: options.solid,
         compress_header: options.compress_header,
         force_zip64: false,
+        password,
+        encrypt_header: options.encrypt_header,
+        zip_cipher: options.zip_cipher,
     };
     match add(
         path,
@@ -320,8 +351,21 @@ fn run_delete(path: &Path, masks: &[String], options: &Options) -> ExitCode {
     }
     let selection = masks.iter().fold(Selection::all(), |sel, m| sel.include(m));
     let selection = options.excludes_applied(selection);
+    let password = match options.password.initial(false) {
+        Ok(password) => password,
+        Err(message) => {
+            eprintln!("ERROR: {message}");
+            return Exit::Fatal.into();
+        }
+    };
     println!("Updating archive: {}\n", path.display());
-    match delete(path, &selection, &mut UpdateConsole, &JobControl::default()) {
+    match delete(
+        path,
+        &selection,
+        password,
+        &mut UpdateConsole,
+        &JobControl::default(),
+    ) {
         Ok(report) => {
             println!("Deleted: {}", report.deleted);
             println!("Everything is Ok");
@@ -350,8 +394,14 @@ fn command_line_error(message: &str) -> ExitCode {
     Exit::CommandLineError.into()
 }
 
-/// Opens the archive and runs `body`, printing 7-Zip style open errors.
-fn with_archive(path: &Path, body: impl FnOnce(&mut Archive) -> ExitCode) -> ExitCode {
+/// Opens the archive and runs `body`, printing 7-Zip style open errors. With
+/// `reads_data`, asks for a password first if items are encrypted.
+fn with_archive(
+    path: &Path,
+    options: &Options,
+    reads_data: bool,
+    body: impl FnOnce(&mut Archive) -> ExitCode,
+) -> ExitCode {
     if !path.exists() {
         eprintln!(
             "ERROR: {}\nThe system cannot find the file specified.",
@@ -359,8 +409,27 @@ fn with_archive(path: &Path, body: impl FnOnce(&mut Archive) -> ExitCode) -> Exi
         );
         return Exit::Fatal.into();
     }
-    match Archive::open(path) {
-        Ok(mut archive) => body(&mut archive),
+    let mut password = match options.password.initial(false) {
+        Ok(password) => password,
+        Err(message) => {
+            eprintln!("ERROR: {message}");
+            return Exit::Fatal.into();
+        }
+    };
+    match open_archive(path, &options.password, &mut password) {
+        Ok(mut archive) => {
+            if reads_data {
+                ensure_item_password(&mut archive, &options.password, &mut password);
+            }
+            body(&mut archive)
+        }
+        Err(Error::Format(FormatError::Encrypted | FormatError::WrongPassword)) => {
+            eprintln!(
+                "ERROR: {}\nCannot open encrypted archive. Wrong password?",
+                path.display()
+            );
+            Exit::Fatal.into()
+        }
         Err(Error::UnknownFormat(_)) => {
             eprintln!("ERROR: {}\nCannot open the file as archive", path.display());
             Exit::Fatal.into()
@@ -511,7 +580,8 @@ impl ExtractHandler for Console {
 fn describe(err: &ItemError) -> String {
     match err {
         ItemError::Checksum => "CRC Failed".to_owned(),
-        ItemError::Encrypted => "Wrong password or encrypted data".to_owned(),
+        ItemError::Encrypted => "Encrypted data needs a password (-p)".to_owned(),
+        ItemError::WrongPassword => "Wrong password".to_owned(),
         ItemError::UnsafePath => "Dangerous path".to_owned(),
         ItemError::UnsafeLink(target) => format!("Dangerous link path was ignored ({target})"),
         other => other.to_string(),

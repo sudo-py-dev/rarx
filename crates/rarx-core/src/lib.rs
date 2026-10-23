@@ -23,8 +23,8 @@ pub use extract::{
     Report, SilentHandler, extract, test,
 };
 pub use job::JobControl;
-pub use rarx_formats::{DataError, Entry, EntryKind, FileTime, FormatError, FormatId};
+pub use rarx_formats::{DataError, Entry, EntryKind, FileTime, FormatError, FormatId, Password};
 pub use update::{
-    AddOptions, ItemAction, SilentUpdate, StorePaths, UpdateHandler, UpdateMode, UpdateReport, add,
-    delete,
+    AddOptions, ItemAction, SilentUpdate, StorePaths, UpdateHandler, UpdateMode, UpdateReport,
+    ZipCipher, add, delete,
 };

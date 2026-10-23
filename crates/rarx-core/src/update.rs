@@ -13,8 +13,10 @@ use std::path::{Component, Path, PathBuf};
 use rarx_formats::sevenz::{SevenZOptions, SevenZReader, SevenZWriter};
 use rarx_formats::stream::{StreamCodec, StreamEncoder};
 use rarx_formats::tar::{StreamReader, TarReader, TarWriter};
-use rarx_formats::zip::{ZipMethod, ZipReader, ZipWriter};
-use rarx_formats::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, NewItem};
+use rarx_formats::zip::{ZipEncryption, ZipMethod, ZipReader, ZipWriter};
+use rarx_formats::{
+    ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, NewItem, Password,
+};
 
 use crate::select::Selection;
 use crate::time::{from_system_time, to_local_civil, to_system_time};
@@ -44,6 +46,16 @@ pub enum UpdateMode {
     Synchronize,
 }
 
+/// Cipher for encrypted ZIP items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZipCipher {
+    /// Legacy PKWARE encryption: weak, but readable by every unzip tool.
+    ZipCrypto,
+    /// WinZip AES-256.
+    #[default]
+    Aes256,
+}
+
 /// Settings for [`add`].
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)] // one flag per command-line switch
@@ -66,6 +78,12 @@ pub struct AddOptions {
     pub compress_header: bool,
     /// Always write ZIP64 records (testing aid).
     pub force_zip64: bool,
+    /// Encrypt new items (and, for 7z, every item, since blocks are rewritten).
+    pub password: Option<Password>,
+    /// 7z: also encrypt the header, hiding file names (`-mhe`, `-hp`).
+    pub encrypt_header: bool,
+    /// ZIP: which cipher `password` uses (`-mem`).
+    pub zip_cipher: ZipCipher,
 }
 
 impl Default for AddOptions {
@@ -80,6 +98,9 @@ impl Default for AddOptions {
             solid: true,
             compress_header: true,
             force_zip64: false,
+            password: None,
+            encrypt_header: false,
+            zip_cipher: ZipCipher::default(),
         }
     }
 }
@@ -156,7 +177,7 @@ pub fn add(
     let mut report = UpdateReport::default();
     let skip = [absolute(archive_path)];
     let sources = collect_sources(inputs, options, &skip, handler, &mut report);
-    let mut existing = OldArchive::open(archive_path, kind)?;
+    let mut existing = OldArchive::open(archive_path, kind, options.password.clone())?;
 
     let replaces_old = |source: &Source, old: &Entry| match options.mode {
         UpdateMode::Add => true,
@@ -222,6 +243,8 @@ pub fn add(
 }
 
 /// Removes the items matching `selection` from the archive at `archive_path`.
+/// `password` is needed for 7z archives with encrypted items or header, whose
+/// remaining items are re-encoded (and stay encrypted).
 ///
 /// # Errors
 /// [`Error::Unsupported`] for archive types RarX cannot write, [`Error::Cancelled`],
@@ -229,11 +252,12 @@ pub fn add(
 pub fn delete(
     archive_path: &Path,
     selection: &Selection,
+    password: Option<Password>,
     handler: &mut dyn UpdateHandler,
     ctl: &JobControl,
 ) -> Result<UpdateReport> {
     let kind = target_kind(archive_path)?;
-    let Some(mut reader) = OldArchive::open(archive_path, kind)? else {
+    let Some(mut reader) = OldArchive::open(archive_path, kind, password.clone())? else {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("{} does not exist", archive_path.display()),
@@ -244,7 +268,7 @@ pub fn delete(
         return Ok(UpdateReport::default());
     }
     let mut report = UpdateReport::default();
-    let options = reader.rewrite_options();
+    let options = reader.rewrite_options(password);
     write_atomically(archive_path, kind, &options, |writer| {
         for (index, entry) in entries.iter().enumerate() {
             ctl.checkpoint()?;
@@ -279,7 +303,7 @@ enum OldArchive {
 }
 
 impl OldArchive {
-    fn open(path: &Path, kind: Kind) -> Result<Option<Self>> {
+    fn open(path: &Path, kind: Kind, password: Option<Password>) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -287,7 +311,7 @@ impl OldArchive {
         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         Ok(Some(match kind {
             Kind::Zip => Self::Zip(ZipReader::new(src)?),
-            Kind::SevenZip => Self::SevenZip(SevenZReader::new(src)?),
+            Kind::SevenZip => Self::SevenZip(SevenZReader::new(src, password)?),
             Kind::Tar(codec) => Self::Other(Box::new(TarReader::new(src, codec)?)),
             Kind::Stream(codec) => Self::Other(Box::new(StreamReader::new(src, codec, &stem))),
         }))
@@ -310,14 +334,20 @@ impl OldArchive {
     }
 
     /// Settings used when an archive is rewritten without new files (delete).
-    fn rewrite_options(&self) -> AddOptions {
-        let solid = match self {
-            Self::SevenZip(r) => r.is_solid(),
-            _ => true,
-        };
-        AddOptions {
-            solid,
-            ..AddOptions::default()
+    /// Settings that rebuild the archive as it was. 7z items are re-encoded, so an
+    /// encrypted archive stays encrypted with the same password.
+    fn rewrite_options(&self, password: Option<Password>) -> AddOptions {
+        match self {
+            Self::SevenZip(r) => {
+                let encrypted = r.is_header_encrypted() || r.entries().iter().any(|e| e.encrypted);
+                AddOptions {
+                    solid: r.is_solid(),
+                    password: password.filter(|_| encrypted),
+                    encrypt_header: r.is_header_encrypted(),
+                    ..AddOptions::default()
+                }
+            }
+            _ => AddOptions::default(),
         }
     }
 }
@@ -467,6 +497,10 @@ fn write_atomically(
             Kind::Zip => {
                 let mut zip = ZipWriter::new(out);
                 zip.set_force_zip64(options.force_zip64);
+                zip.set_encryption(options.password.clone().map(|pw| match options.zip_cipher {
+                    ZipCipher::ZipCrypto => ZipEncryption::ZipCrypto(pw),
+                    ZipCipher::Aes256 => ZipEncryption::Aes256(pw),
+                }));
                 NewArchive::Zip(zip)
             }
             Kind::SevenZip => {
@@ -474,8 +508,15 @@ fn write_atomically(
                     level: options.level,
                     solid: options.solid,
                     compress_header: options.compress_header,
+                    password: options.password.clone(),
+                    encrypt_header: options.encrypt_header,
                 };
                 NewArchive::SevenZip(SevenZWriter::new(out, settings)?)
+            }
+            Kind::Tar(_) | Kind::Stream(_) if options.password.is_some() => {
+                return Err(Error::Unsupported(
+                    "encryption in TAR and single-stream archives".to_owned(),
+                ));
             }
             Kind::Tar(None) => NewArchive::Tar(TarWriter::new(OutStream::Plain(out))),
             Kind::Tar(Some(codec)) => {

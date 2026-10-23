@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 rarx-core.workspace = true
+rpassword.workspace = true
 
 [dev-dependencies]
 rarx-testkit.workspace = true

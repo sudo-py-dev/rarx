@@ -225,6 +225,7 @@ fn sevenz_rust2_archives() {
         "s7r-nonsolid.7z",
         "s7r-bcj-lzma2.7z",
         "s7r-deflate.7z",
+        "s7r-ppmd.7z",
     ] {
         let tmp = TempDir::new("7z-s7r");
         let report = extract_all(name, tmp.path());
@@ -238,16 +239,4 @@ fn sevenz_rust2_archives() {
             "{name}"
         );
     }
-}
-
-#[test]
-fn unsupported_methods_are_named() {
-    let report = test_all("s7r-ppmd.7z");
-    assert_ne!(report.errors.len(), 0);
-    assert!(
-        report
-            .errors
-            .iter()
-            .all(|(_, e)| matches!(e, ItemError::Unsupported(m) if m.contains("PPMD")))
-    );
 }
