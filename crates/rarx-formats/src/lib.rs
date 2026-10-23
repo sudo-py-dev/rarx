@@ -11,7 +11,10 @@ mod error;
 mod new_item;
 mod reader;
 pub mod sevenz;
+mod shared;
 mod signature;
+pub mod stream;
+pub mod tar;
 mod verify;
 pub mod zip;
 

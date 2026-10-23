@@ -1,5 +1,7 @@
 use std::io::{Read, Seek};
 
+use crate::stream::StreamCodec;
+use crate::tar::{StreamReader, TarReader};
 use crate::{Entry, FormatError, FormatId};
 
 /// A seekable byte source an archive is read from.
@@ -29,20 +31,31 @@ pub trait ArchiveReader: Send {
     fn open_entry(&mut self, index: usize) -> Result<Box<dyn Read + '_>, FormatError>;
 }
 
-/// Opens `src` as an archive of the given format.
+/// Opens `src` as an archive of the given format. `name_hint` names the single item
+/// of a plain compressed stream (e.g. `notes.txt` for `notes.txt.gz`).
 ///
 /// # Errors
 /// [`FormatError::Unsupported`] if RarX cannot read that format yet, or any error
 /// from parsing the archive's headers.
 pub fn open(
     format: FormatId,
-    src: Box<dyn ReadSeek>,
+    mut src: Box<dyn ReadSeek>,
+    name_hint: &str,
 ) -> Result<Box<dyn ArchiveReader>, FormatError> {
+    if let Some(codec) = StreamCodec::from_format(format) {
+        return Ok(if crate::tar::starts_with_tar(&mut src, codec)? {
+            Box::new(TarReader::new(src, Some(codec))?)
+        } else {
+            Box::new(StreamReader::new(src, codec, name_hint))
+        });
+    }
     match format {
         FormatId::Zip => Ok(Box::new(crate::zip::ZipReader::new(src)?)),
         FormatId::SevenZip => Ok(Box::new(crate::sevenz::SevenZReader::new(src)?)),
+        FormatId::Tar => Ok(Box::new(TarReader::new(src, None)?)),
         other => Err(FormatError::Unsupported(format!(
-            "reading {other:?} archives"
+            "reading {} archives",
+            other.name()
         ))),
     }
 }

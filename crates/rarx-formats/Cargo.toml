@@ -12,6 +12,8 @@ rarx-io.workspace = true
 rarx-checksum.workspace = true
 flate2.workspace = true
 lzma-rust2.workspace = true
+bzip2.workspace = true
+zstd.workspace = true
 
 [lints]
 workspace = true

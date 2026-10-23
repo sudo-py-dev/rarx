@@ -1,8 +1,7 @@
 //! Turning a 7z folder (a graph of coders) into one decoded stream.
 
 use std::fmt::Write as _;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
+use std::io::{BufReader, Read};
 
 use flate2::bufread::DeflateDecoder;
 use lzma_rust2::filter::bcj::BcjReader;
@@ -11,10 +10,10 @@ use lzma_rust2::filter::delta::DeltaReader;
 use lzma_rust2::{Lzma2Reader, LzmaReader};
 
 use super::header::{Coder, Folder};
-use crate::{FormatError, ReadSeek};
+use crate::FormatError;
+use crate::shared::Region;
 
-/// The archive file, shared by every pack-stream reader of a folder.
-pub(super) type Shared = Arc<Mutex<Box<dyn ReadSeek>>>;
+pub(super) use crate::shared::Shared;
 pub(super) type Stream = Box<dyn Read + Send>;
 
 const REGION_BUFFER: usize = 64 * 1024;
@@ -39,31 +38,6 @@ const DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
 const DEFLATE64: &[u8] = &[0x04, 0x01, 0x09];
 const ZSTD: &[u8] = &[0x04, 0xF7, 0x11, 0x01];
 pub(super) const AES: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
-
-/// Reads one byte range of the shared archive file.
-struct Region {
-    src: Shared,
-    pos: u64,
-    end: u64,
-}
-
-impl Read for Region {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let left = self.end.saturating_sub(self.pos);
-        let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
-        if want == 0 {
-            return Ok(0);
-        }
-        let mut src = self
-            .src
-            .lock()
-            .map_err(|_| io::Error::other("archive reader poisoned"))?;
-        src.seek(SeekFrom::Start(self.pos))?;
-        let n = src.read(&mut buf[..want])?;
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
 
 /// Builds the decoded stream of `folder`. `packs` holds the absolute `(offset, size)`
 /// of each of the folder's pack streams.
@@ -140,11 +114,7 @@ impl Graph<'_> {
                 .packs
                 .get(p)
                 .ok_or_else(|| FormatError::Corrupt("7z pack stream missing".to_owned()))?;
-            let region = Region {
-                src: Arc::clone(self.src),
-                pos: offset,
-                end: offset + size,
-            };
+            let region = Region::new(self.src, offset, size);
             return Ok(Box::new(BufReader::with_capacity(REGION_BUFFER, region)));
         }
         let &(_, out) = self

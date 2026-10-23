@@ -11,6 +11,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use rarx_formats::sevenz::{SevenZOptions, SevenZReader, SevenZWriter};
+use rarx_formats::stream::{StreamCodec, StreamEncoder};
+use rarx_formats::tar::{StreamReader, TarReader, TarWriter};
 use rarx_formats::zip::{ZipMethod, ZipReader, ZipWriter};
 use rarx_formats::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, NewItem};
 
@@ -262,12 +264,18 @@ pub fn delete(
 enum Kind {
     Zip,
     SevenZip,
+    /// TAR, optionally compressed as a whole.
+    Tar(Option<StreamCodec>),
+    /// One compressed file (`.gz`, `.bz2`, `.xz`, `.zst`).
+    Stream(StreamCodec),
 }
 
 /// The archive being updated.
 enum OldArchive {
     Zip(ZipReader),
     SevenZip(SevenZReader),
+    /// Formats whose kept items are decoded and written again.
+    Other(Box<dyn ArchiveReader>),
 }
 
 impl OldArchive {
@@ -276,24 +284,36 @@ impl OldArchive {
             return Ok(None);
         }
         let src = Box::new(BufReader::new(File::open(path)?));
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         Ok(Some(match kind {
             Kind::Zip => Self::Zip(ZipReader::new(src)?),
             Kind::SevenZip => Self::SevenZip(SevenZReader::new(src)?),
+            Kind::Tar(codec) => Self::Other(Box::new(TarReader::new(src, codec)?)),
+            Kind::Stream(codec) => Self::Other(Box::new(StreamReader::new(src, codec, &stem))),
         }))
+    }
+
+    fn reader(&mut self) -> &mut dyn ArchiveReader {
+        match self {
+            Self::Zip(r) => r,
+            Self::SevenZip(r) => r,
+            Self::Other(r) => r.as_mut(),
+        }
     }
 
     fn entries(&self) -> &[Entry] {
         match self {
             Self::Zip(r) => r.entries(),
             Self::SevenZip(r) => r.entries(),
+            Self::Other(r) => r.entries(),
         }
     }
 
     /// Settings used when an archive is rewritten without new files (delete).
     fn rewrite_options(&self) -> AddOptions {
         let solid = match self {
-            Self::Zip(_) => true,
             Self::SevenZip(r) => r.is_solid(),
+            _ => true,
         };
         AddOptions {
             solid,
@@ -302,10 +322,60 @@ impl OldArchive {
     }
 }
 
+/// Output of a TAR or single-stream archive: plain or compressed.
+enum OutStream {
+    Plain(BufWriter<File>),
+    Compressed(Box<StreamEncoder<BufWriter<File>>>),
+}
+
+impl OutStream {
+    fn finish(self) -> std::io::Result<BufWriter<File>> {
+        match self {
+            Self::Plain(out) => Ok(out),
+            Self::Compressed(encoder) => encoder.finish(),
+        }
+    }
+}
+
+impl Write for OutStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(out) => out.write(buf),
+            Self::Compressed(encoder) => encoder.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(out) => out.flush(),
+            Self::Compressed(encoder) => encoder.flush(),
+        }
+    }
+}
+
 /// The archive being written.
 enum NewArchive {
     Zip(ZipWriter<BufWriter<File>>),
     SevenZip(SevenZWriter<BufWriter<File>>),
+    Tar(TarWriter<OutStream>),
+    /// A single compressed file; the encoder starts with the first (only) item so
+    /// the gzip header can carry its name and time.
+    Stream {
+        codec: StreamCodec,
+        level: u32,
+        out: Option<BufWriter<File>>,
+        encoder: Option<StreamEncoder<BufWriter<File>>>,
+    },
+}
+
+fn one_file_only(codec: StreamCodec) -> std::io::Error {
+    let ext = codec.extension();
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "a .{ext} file holds exactly one file; use .tar.{ext} for several files or folders"
+        ),
+    )
 }
 
 impl NewArchive {
@@ -313,6 +383,8 @@ impl NewArchive {
         match self {
             Self::Zip(w) => w.add_directory(item),
             Self::SevenZip(w) => w.add_directory(item),
+            Self::Tar(w) => w.add_directory(item),
+            Self::Stream { codec, .. } => Err(one_file_only(*codec)),
         }
     }
 
@@ -320,6 +392,8 @@ impl NewArchive {
         match self {
             Self::Zip(w) => w.add_symlink(item, target),
             Self::SevenZip(w) => w.add_symlink(item, target),
+            Self::Tar(w) => w.add_symlink(item, target),
+            Self::Stream { codec, .. } => Err(one_file_only(*codec)),
         }
     }
 
@@ -335,6 +409,26 @@ impl NewArchive {
                 w.add_file(item, method, data)
             }
             Self::SevenZip(w) => w.add_file(item, data),
+            Self::Tar(w) => w.add_file(item, data),
+            Self::Stream {
+                codec,
+                level,
+                out,
+                encoder,
+            } => {
+                let Some(out) = out.take() else {
+                    return Err(one_file_only(*codec));
+                };
+                let name = item.name.rsplit('/').next();
+                let mtime = match item.modified {
+                    Some(FileTime::Unix { seconds, .. }) => u32::try_from(seconds).ok(),
+                    _ => None,
+                };
+                let mut active = codec.encoder(out, *level, name, mtime)?;
+                std::io::copy(data, &mut active)?;
+                *encoder = Some(active);
+                Ok(())
+            }
         }
     }
 
@@ -342,6 +436,18 @@ impl NewArchive {
         match self {
             Self::Zip(w) => w.finish(None),
             Self::SevenZip(w) => w.finish(),
+            Self::Tar(w) => w.finish()?.finish(),
+            Self::Stream {
+                codec,
+                level,
+                out,
+                encoder,
+            } => match (encoder, out) {
+                (Some(encoder), _) => encoder.finish(),
+                // Nothing was added: write a valid empty stream.
+                (None, Some(out)) => codec.encoder(out, level, None, None)?.finish(),
+                (None, None) => Err(std::io::Error::other("stream writer lost its output")),
+            },
         }
     }
 }
@@ -371,6 +477,17 @@ fn write_atomically(
                 };
                 NewArchive::SevenZip(SevenZWriter::new(out, settings)?)
             }
+            Kind::Tar(None) => NewArchive::Tar(TarWriter::new(OutStream::Plain(out))),
+            Kind::Tar(Some(codec)) => {
+                let encoder = codec.encoder(out, options.level, None, None)?;
+                NewArchive::Tar(TarWriter::new(OutStream::Compressed(Box::new(encoder))))
+            }
+            Kind::Stream(codec) => NewArchive::Stream {
+                codec,
+                level: options.level,
+                out: Some(out),
+                encoder: None,
+            },
         };
         let mut report = body(&mut writer)?;
         let mut out = writer.finish()?;
@@ -395,33 +512,70 @@ fn temp_path(target: &Path) -> PathBuf {
 
 /// Which format to write: that of the existing archive, else from the extension.
 fn target_kind(archive_path: &Path) -> Result<Kind> {
+    let by_name = kind_from_name(archive_path);
     if archive_path.exists() {
         return match crate::detect_file(archive_path)? {
             Some(FormatId::Zip) => Ok(Kind::Zip),
             Some(FormatId::SevenZip) => Ok(Kind::SevenZip),
-            Some(other) => Err(Error::Unsupported(format!(
-                "updating {} archives",
-                other.name()
-            ))),
+            Some(FormatId::Tar) => Ok(Kind::Tar(None)),
+            Some(other) => match (StreamCodec::from_format(other), by_name) {
+                (Some(codec), Ok(Kind::Tar(Some(_)))) => Ok(Kind::Tar(Some(codec))),
+                (Some(codec), _) => Ok(Kind::Stream(codec)),
+                (None, _) => Err(Error::Unsupported(format!(
+                    "updating {} archives",
+                    other.name()
+                ))),
+            },
+            None if matches!(by_name, Ok(Kind::Tar(None))) => Ok(Kind::Tar(None)),
             None => Err(Error::UnknownFormat(archive_path.to_owned())),
         };
     }
-    let ext = archive_path
-        .extension()
-        .and_then(|e| e.to_str())
+    by_name
+}
+
+/// Archive kind implied by the file name, e.g. `.tar.gz` or `.tgz`.
+fn kind_from_name(archive_path: &Path) -> Result<Kind> {
+    let name = archive_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let tar_suffixes: [(&[&str], Option<StreamCodec>); 5] = [
+        (&[".tar"], None),
+        (&[".tar.gz", ".tgz", ".taz"], Some(StreamCodec::Gzip)),
+        (
+            &[".tar.bz2", ".tbz", ".tbz2", ".tb2"],
+            Some(StreamCodec::Bzip2),
+        ),
+        (&[".tar.xz", ".txz"], Some(StreamCodec::Xz)),
+        (&[".tar.zst", ".tzst"], Some(StreamCodec::Zstd)),
+    ];
+    for (suffixes, codec) in tar_suffixes {
+        if suffixes.iter().any(|s| name.ends_with(s)) {
+            return Ok(Kind::Tar(codec));
+        }
+    }
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext)
         .unwrap_or_default();
-    match ext.to_ascii_lowercase().as_str() {
+    match ext {
         "zip" | "jar" | "zipx" | "apk" | "epub" | "xpi" | "cbz" => Ok(Kind::Zip),
         "7z" => Ok(Kind::SevenZip),
+        "gz" => Ok(Kind::Stream(StreamCodec::Gzip)),
+        "bz2" => Ok(Kind::Stream(StreamCodec::Bzip2)),
+        "xz" => Ok(Kind::Stream(StreamCodec::Xz)),
+        "zst" => Ok(Kind::Stream(StreamCodec::Zstd)),
         "" => Err(Error::Unsupported(
-            "archives without an extension; add .zip or .7z".to_owned(),
+            "archives without an extension; add .zip, .7z or .tar.*".to_owned(),
         )),
         other => Err(Error::Unsupported(format!("creating .{other} archives"))),
     }
 }
 
 /// Carries an existing item over into the new archive: ZIP items are copied byte
-/// for byte; 7z items are decoded and re-encoded, because they share solid blocks.
+/// for byte; items of other formats are decoded and written again (7z items share
+/// solid blocks, TAR streams have no item boundaries worth preserving).
 fn keep(
     reader: &mut OldArchive,
     index: usize,
@@ -432,7 +586,13 @@ fn keep(
     let entry = reader.entries()[index].clone();
     match (reader, writer) {
         (OldArchive::Zip(r), NewArchive::Zip(w)) => r.copy_raw(index, w)?,
-        (OldArchive::SevenZip(r), writer) => {
+        (OldArchive::Zip(_), _) => {
+            return Err(Error::Unsupported(
+                "converting ZIP to another format".to_owned(),
+            ));
+        }
+        (old, writer) => {
+            let r = old.reader();
             let mut item = NewItem::new(entry.name.clone(), entry.kind);
             item.modified = entry.modified;
             item.unix_mode = entry.unix_mode.map(|m| m & 0o7777);
@@ -447,9 +607,6 @@ fn keep(
                 }
                 EntryKind::File => writer.add_file(&item, 0, &mut r.open_entry(index)?)?,
             }
-        }
-        (OldArchive::Zip(_), NewArchive::SevenZip(_)) => {
-            return Err(Error::Unsupported("converting ZIP to 7z".to_owned()));
         }
     }
     report.kept += 1;

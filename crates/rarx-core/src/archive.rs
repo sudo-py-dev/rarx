@@ -7,7 +7,7 @@ use rarx_formats::{ArchiveReader, Entry, FormatError, FormatId};
 use crate::{Error, Result};
 
 /// Bytes read from the start of a file for signature detection.
-const DETECT_PREFIX_LEN: u64 = 64;
+const DETECT_PREFIX_LEN: u64 = 512;
 
 /// Extensions that are ZIP containers even when the file does not start with a ZIP
 /// signature (e.g. self-extracting archives).
@@ -45,10 +45,12 @@ impl Archive {
         let format = match detect_file(path)? {
             Some(format) => format,
             None if has_zip_extension(path) => FormatId::Zip,
+            None if has_extension(path, "tar") => FormatId::Tar,
             None => return Err(Error::UnknownFormat(path.to_owned())),
         };
         let src = Box::new(BufReader::new(File::open(path)?));
-        let reader = rarx_formats::open(format, src).map_err(|err| match err {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let reader = rarx_formats::open(format, src, &stem).map_err(|err| match err {
             FormatError::Corrupt(_) if format == FormatId::Zip && !starts_like_zip(path) => {
                 Error::UnknownFormat(path.to_owned())
             }
@@ -96,6 +98,12 @@ impl Archive {
     pub(crate) fn reader_mut(&mut self) -> &mut dyn ArchiveReader {
         self.reader.as_mut()
     }
+}
+
+fn has_extension(path: &Path, wanted: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(wanted))
 }
 
 fn has_zip_extension(path: &Path) -> bool {

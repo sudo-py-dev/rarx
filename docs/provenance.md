@@ -18,3 +18,5 @@ Every codec, filter, cipher and format parser records where its specification ca
 | DOS local time → UTC | jiff (crates.io) | system tz database | third-party crate, MIT/Unlicense |
 | 7z container | rarx-formats | `7zFormat.txt` (LZMA SDK, public domain) | |
 | LZMA / LZMA2 / BCJ / BCJ2 / Delta decoding | lzma-rust2 (crates.io) | port of XZ for Java / LZMA SDK | third-party crate, Apache-2.0 |
+| TAR (ustar, GNU, pax) | rarx-formats | POSIX.1-2008 `pax` spec; GNU tar manual (`L`/`K`, base-256) | |
+| gzip / bzip2 / xz / Zstandard streams | flate2, bzip2 (libbz2-rs-sys), lzma-rust2, zstd (libzstd) | RFC 1952; bzip2 format; xz file format spec; RFC 8878 | third-party crates; bzip2-1.0.6 and BSD-3-Clause licences |

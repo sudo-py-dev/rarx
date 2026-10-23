@@ -18,6 +18,8 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
+    # libbz2-rs-sys (pure-Rust bzip2): the permissive bzip2 licence.
+    "bzip2-1.0.6",
 ]
 exceptions = []
 

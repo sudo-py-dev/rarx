@@ -20,6 +20,8 @@ pub enum FormatId {
     Zstd,
     /// LZ4 frame.
     Lz4,
+    /// POSIX/GNU TAR.
+    Tar,
 }
 
 impl FormatId {
@@ -36,6 +38,7 @@ impl FormatId {
             Self::Xz => "xz",
             Self::Zstd => "zstd",
             Self::Lz4 => "lz4",
+            Self::Tar => "tar",
         }
     }
 }
@@ -65,6 +68,11 @@ const SIGNATURES: &[Signature] = &[
     sig(FormatId::Xz, b"\xFD7zXZ\x00"),
     sig(FormatId::Zstd, b"\x28\xB5\x2F\xFD"),
     sig(FormatId::Lz4, b"\x04\x22\x4D\x18"),
+    Signature {
+        format: FormatId::Tar,
+        offset: 257,
+        magic: b"ustar",
+    },
 ];
 
 const fn sig(format: FormatId, magic: &'static [u8]) -> Signature {

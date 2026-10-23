@@ -41,7 +41,7 @@ Usage: rx7 <command> [<switches>...] <archive_name> [<file_names>...]
   -slt : show technical information for l (List) command
   -snl : store symbolic links as links
   -so : write data to stdout
-  -t{Type} : Set type of archive (7z or zip for creation)
+  -t{Type} : Set type of archive (7z, zip, tar, gzip, bzip2, xz, zstd)
   -x!{wildcard} : eXclude filenames
   -y : assume Yes on all queries";
 
@@ -175,28 +175,51 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
     Ok(options)
 }
 
-/// Resolves the archive to write: 7-Zip appends `.<type>` (default `.7z`) to names
-/// without an extension. Returns the path and whether it is a 7z archive.
+/// Resolves the archive to write. 7-Zip appends the type's extension (default `.7z`)
+/// to names without one; `-t` must agree with an explicit extension. Returns the
+/// path and whether it is a ZIP archive (whose levels map onto Deflate).
 fn archive_target(path: &Path, archive_type: Option<&str>) -> Result<(PathBuf, bool), String> {
-    if let Some(other) = archive_type.filter(|t| !matches!(*t, "7z" | "zip")) {
-        return Err(format!("creating {other} archives is not supported yet"));
-    }
+    let ty_ext = match archive_type {
+        None => None,
+        Some("7z") => Some("7z"),
+        Some("zip") => Some("zip"),
+        Some("tar") => Some("tar"),
+        Some("gzip" | "gz") => Some("gz"),
+        Some("bzip2" | "bz2") => Some("bz2"),
+        Some("xz") => Some("xz"),
+        Some("zstd" | "zst") => Some("zst"),
+        Some(other) => return Err(format!("creating {other} archives is not supported yet")),
+    };
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
     let Some(ext) = ext else {
-        let ty = archive_type.unwrap_or("7z");
+        let ext = ty_ext.unwrap_or("7z");
         let mut named = path.as_os_str().to_owned();
-        named.push(format!(".{ty}"));
-        return Ok((PathBuf::from(named), ty == "7z"));
+        named.push(format!(".{ext}"));
+        return Ok((PathBuf::from(named), ext == "zip"));
     };
-    let is_7z = ext == "7z";
-    match archive_type {
-        Some("7z") if !is_7z => Err(format!("-t7z does not match the .{ext} extension")),
-        Some("zip") if is_7z => Err("-tzip does not match the .7z extension".to_owned()),
-        _ => Ok((path.to_owned(), is_7z)),
+    // `.tgz`-style names are fine for `-tgzip` etc.; only reject clear mismatches.
+    let aliases: &[&str] = match ty_ext {
+        Some("gz") => &["gz", "tgz", "taz"],
+        Some("bz2") => &["bz2", "tbz", "tbz2", "tb2"],
+        Some("xz") => &["xz", "txz"],
+        Some("zst") => &["zst", "tzst"],
+        Some("7z") => &["7z"],
+        Some("zip") => &["zip", "jar", "zipx", "apk", "epub", "xpi", "cbz"],
+        Some("tar") => &["tar"],
+        _ => &[],
+    };
+    if ty_ext.is_some() && !aliases.contains(&ext.as_str()) {
+        let ty = archive_type.unwrap_or_default();
+        return Err(format!("-t{ty} does not match the .{ext} extension"));
     }
+    let is_zip = matches!(
+        ext.as_str(),
+        "zip" | "jar" | "zipx" | "apk" | "epub" | "xpi" | "cbz"
+    );
+    Ok((path.to_owned(), is_zip))
 }
 
 /// Maps 7-Zip `-mx` levels (0–9) onto Deflate levels.
@@ -221,7 +244,7 @@ impl UpdateHandler for UpdateConsole {
 }
 
 fn run_add(path: &Path, inputs: &[String], options: &Options, mode: UpdateMode) -> ExitCode {
-    let (path, is_7z) = match archive_target(path, options.archive_type.as_deref()) {
+    let (path, is_zip) = match archive_target(path, options.archive_type.as_deref()) {
         Ok(target) => target,
         Err(message) => {
             eprintln!("ERROR: {message}");
@@ -241,10 +264,10 @@ fn run_add(path: &Path, inputs: &[String], options: &Options, mode: UpdateMode) 
     };
     println!("{verb} archive: {}\n", path.display());
     let add_options = AddOptions {
-        level: if is_7z {
-            options.mx
-        } else {
+        level: if is_zip {
             deflate_level(options.mx)
+        } else {
+            options.mx
         },
         paths: StorePaths::Relative,
         mode,

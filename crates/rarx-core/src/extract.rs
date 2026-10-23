@@ -229,7 +229,10 @@ pub fn extract(
         };
         job.handler.item_started(entry);
         let Some(rel) = sanitize_path(name, options.name_rules) else {
-            job.finish(entry, &Outcome::Failed(ItemError::UnsafePath));
+            // A folder named `.` or `./` is the destination itself (GNU tar `-C dir .`).
+            if !(entry.is_dir() && is_current_dir(name)) {
+                job.finish(entry, &Outcome::Failed(ItemError::UnsafePath));
+            }
             continue;
         };
         let outcome = match entry.kind {
@@ -532,6 +535,11 @@ fn format_error(err: FormatError) -> ItemError {
         FormatError::Unsupported(what) => ItemError::Unsupported(what),
         other => ItemError::Data(other.to_string()),
     }
+}
+
+/// Whether `name` only consists of `.` components and separators.
+fn is_current_dir(name: &str) -> bool {
+    name.split(['/', '\\']).all(|part| matches!(part, "" | "."))
 }
 
 /// Picks `name_1.ext`, `name_2.ext`, … — the first that does not exist yet.

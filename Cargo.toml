@@ -22,7 +22,9 @@ rarx-testkit = { path = "crates/rarx-testkit" }
 
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 jiff = "0.2"
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "encoder", "optimization"] }
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+bzip2 = "0.6"
+zstd = { version = "0.13", default-features = false, features = ["zstdmt"] }
 
 [workspace.lints.rust]
 # Crates that genuinely need `unsafe` (see AGENT.md §18.6) opt in with a crate-level

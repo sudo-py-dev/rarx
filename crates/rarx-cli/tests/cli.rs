@@ -310,3 +310,37 @@ fn rx7_creates_7z_archives() {
     );
     assert_eq!(code(&mismatch), Some(2));
 }
+
+#[test]
+fn tar_family_through_both_clis() {
+    let tmp = TempDir::new("cli-tar");
+    let src = sample_tree(tmp.path());
+    let archive = tmp.path().join("bundle.tar.xz");
+    assert_eq!(
+        code(&run(RX7, &["a", arg(&archive), arg(&src)], "")),
+        Some(0)
+    );
+    assert!(stdout(&run(RX7, &["l", arg(&archive)], "")).contains("Type = tar"));
+    assert_eq!(code(&run(RARX, &["t", arg(&archive)], "")), Some(0));
+
+    let bare = tmp.path().join("bundle");
+    assert_eq!(
+        code(&run(RX7, &["a", "-ttar", arg(&bare), arg(&src)], "")),
+        Some(0)
+    );
+    assert!(tmp.path().join("bundle.tar").is_file());
+
+    let single = tmp.path().join("a.txt.zst");
+    assert_eq!(
+        code(&run(RX7, &["a", arg(&single), arg(&src.join("a.txt"))], "")),
+        Some(0)
+    );
+    let printed = run(RX7, &["e", "-so", arg(&single)], "");
+    assert_eq!(stdout(&printed), "alpha\n".repeat(50));
+    let mismatch = run(
+        RX7,
+        &["a", "-tgzip", arg(&tmp.path().join("x.xz")), arg(&src)],
+        "",
+    );
+    assert_eq!(code(&mismatch), Some(2));
+}
