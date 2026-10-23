@@ -232,6 +232,10 @@ fn add_with(archive: &Path, inputs: &[PathBuf]) -> UpdateReport {
 }
 
 fn gnu_tar_lists(archive: &Path) -> Option<Vec<String>> {
+    // Windows ships bsdtar, which cannot print names outside the console code page.
+    if cfg!(windows) {
+        return None;
+    }
     let out = Command::new("tar").arg("-tf").arg(archive).output().ok()?;
     assert!(
         out.status.success(),
@@ -292,8 +296,11 @@ fn writes_tar_family_that_round_trips() {
 
         if let Some(names) = gnu_tar_lists(&archive) {
             assert!(names.contains(&deep), "{name}: {names:?}");
+            // macOS file systems may hand back the decomposed (NFD) spelling.
             assert!(
-                names.contains(&"src/naïve 日本.txt".to_owned()),
+                names
+                    .iter()
+                    .any(|n| n.replace("i\u{308}", "ï") == "src/naïve 日本.txt"),
                 "{name}: {names:?}"
             );
             assert!(
