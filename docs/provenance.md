@@ -16,3 +16,5 @@ Every codec, filter, cipher and format parser records where its specification ca
 | CP437 table | rarx-formats | IBM code page 437 (Unicode mapping tables) | |
 | Deflate decoding | flate2 + zlib-rs (crates.io) | RFC 1951 | third-party crate, MIT/Apache-2.0 / Zlib |
 | DOS local time → UTC | jiff (crates.io) | system tz database | third-party crate, MIT/Unlicense |
+| 7z container | rarx-formats | `7zFormat.txt` (LZMA SDK, public domain) | |
+| LZMA / LZMA2 / BCJ / BCJ2 / Delta decoding | lzma-rust2 (crates.io) | port of XZ for Java / LZMA SDK | third-party crate, Apache-2.0 |

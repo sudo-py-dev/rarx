@@ -370,10 +370,7 @@ fn list(archive: &mut Archive, command: &str, options: &Options) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!("Archive: {}", archive.path().display());
-    println!(
-        "Details: {}\n",
-        format!("{:?}", archive.format()).to_uppercase()
-    );
+    println!("Details: {}\n", archive.format().name().to_uppercase());
     if let Some(comment) = archive.comment() {
         println!("{comment}\n");
     }

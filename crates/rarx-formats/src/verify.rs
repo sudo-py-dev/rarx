@@ -4,20 +4,21 @@ use rarx_checksum::{Checksum, Crc32};
 
 use crate::DataError;
 
-/// Passes data through while checking it against the expected size and CRC-32.
+/// Passes data through while checking it against the expected size and, when
+/// known, CRC-32.
 ///
 /// Fails as soon as more data than `expected_size` arrives, so a lying header
 /// cannot turn into unbounded output.
 pub(crate) struct VerifyReader<R> {
     inner: R,
     crc: Crc32,
-    expected_crc: u32,
+    expected_crc: Option<u32>,
     expected_size: u64,
     seen: u64,
 }
 
 impl<R: Read> VerifyReader<R> {
-    pub(crate) fn new(inner: R, expected_size: u64, expected_crc: u32) -> Self {
+    pub(crate) fn new(inner: R, expected_size: u64, expected_crc: Option<u32>) -> Self {
         Self {
             inner,
             crc: Crc32::default(),
@@ -38,7 +39,10 @@ impl<R: Read> Read for VerifyReader<R> {
             if self.seen != self.expected_size {
                 return Err(DataError::SizeMismatch.into());
             }
-            if self.crc.finalize() != self.expected_crc {
+            if self
+                .expected_crc
+                .is_some_and(|crc| crc != self.crc.finalize())
+            {
                 return Err(DataError::ChecksumMismatch.into());
             }
             return Ok(0);
@@ -58,7 +62,7 @@ mod tests {
 
     fn read_all(data: &[u8], size: u64, crc: u32) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        VerifyReader::new(data, size, crc).read_to_end(&mut out)?;
+        VerifyReader::new(data, size, Some(crc)).read_to_end(&mut out)?;
         Ok(out)
     }
 

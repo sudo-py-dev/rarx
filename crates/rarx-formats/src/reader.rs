@@ -40,6 +40,7 @@ pub fn open(
 ) -> Result<Box<dyn ArchiveReader>, FormatError> {
     match format {
         FormatId::Zip => Ok(Box::new(crate::zip::ZipReader::new(src)?)),
+        FormatId::SevenZip => Ok(Box::new(crate::sevenz::SevenZReader::new(src)?)),
         other => Err(FormatError::Unsupported(format!(
             "reading {other:?} archives"
         ))),

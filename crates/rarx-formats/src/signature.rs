@@ -22,6 +22,24 @@ pub enum FormatId {
     Lz4,
 }
 
+impl FormatId {
+    /// Short type name as 7-Zip prints it (`7z`, `zip`, `rar`, …).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SevenZip => "7z",
+            Self::Rar5 => "rar5",
+            Self::Rar4 => "rar",
+            Self::Zip => "zip",
+            Self::Gzip => "gzip",
+            Self::Bzip2 => "bzip2",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+            Self::Lz4 => "lz4",
+        }
+    }
+}
+
 /// Magic bytes found at a fixed offset from the start of a file.
 #[derive(Clone, Copy, Debug)]
 pub struct Signature {

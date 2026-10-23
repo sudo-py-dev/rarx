@@ -9,6 +9,7 @@
 mod entry;
 mod error;
 mod reader;
+pub mod sevenz;
 mod signature;
 mod verify;
 pub mod zip;

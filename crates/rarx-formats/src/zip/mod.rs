@@ -209,7 +209,7 @@ impl ArchiveReader for ZipReader {
                 )));
             }
         };
-        Ok(Box::new(VerifyReader::new(decoded, size, crc32)))
+        Ok(Box::new(VerifyReader::new(decoded, size, Some(crc32))))
     }
 }
 

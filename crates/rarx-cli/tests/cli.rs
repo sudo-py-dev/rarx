@@ -249,3 +249,26 @@ fn rarx_bare_listing_and_print() {
     );
     assert_eq!(stdout(&printed), "unicode folder\n");
 }
+
+#[test]
+fn reads_7z_archives() {
+    let archive = corpus_file("7z/lzma2-solid.7z");
+    let listing = stdout(&run(RX7, &["l", arg(&archive)], ""));
+    assert!(listing.contains("Type = 7z") && listing.contains("docs/a.txt"));
+    assert_eq!(code(&run(RX7, &["t", arg(&archive)], "")), Some(0));
+    assert_eq!(
+        code(&run(
+            RARX,
+            &["t", arg(&corpus_file("7z/corrupt-crc.7z"))],
+            ""
+        )),
+        Some(3)
+    );
+    let printed = run(RARX, &["p", "-inul", arg(&archive), "naïve*"], "");
+    assert_eq!(stdout(&printed), "unicode name\n");
+    assert_eq!(
+        code(&run(RX7, &["a", arg(&archive), "x"], "")),
+        Some(2),
+        "7z writing is not available yet"
+    );
+}

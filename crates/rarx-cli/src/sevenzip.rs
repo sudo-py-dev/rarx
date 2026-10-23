@@ -318,7 +318,7 @@ fn print_archive_header(archive: &Archive) {
 }
 
 fn format_name(archive: &Archive) -> String {
-    format!("{:?}", archive.format()).to_lowercase()
+    archive.format().name().to_owned()
 }
 
 fn list(archive: &mut Archive, options: &Options) -> ExitCode {
