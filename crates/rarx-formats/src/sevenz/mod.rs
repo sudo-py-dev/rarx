@@ -7,6 +7,7 @@
 
 mod coders;
 mod header;
+mod writer;
 
 use std::io::{self, Read, SeekFrom};
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,8 @@ use self::coders::{AES, Shared, Stream, folder_stream, method_label, read_folder
 use self::header::{Folder, Header, K_ENCODED_HEADER, K_HEADER, parse_header, parse_streams_info};
 use crate::verify::VerifyReader;
 use crate::{ArchiveReader, Entry, EntryKind, FormatError, FormatId, ReadSeek};
+
+pub use writer::{SevenZOptions, SevenZWriter};
 
 const SIGNATURE: &[u8; 6] = b"7z\xBC\xAF\x27\x1C";
 const START_HEADER_LEN: u64 = 32;
@@ -127,6 +130,12 @@ impl SevenZReader {
         let header = reader.decode_header(raw, file_len)?;
         reader.load(header, file_len)?;
         Ok(reader)
+    }
+
+    /// Whether any block holds more than one file.
+    #[must_use]
+    pub fn is_solid(&self) -> bool {
+        self.folders.iter().any(|f| f.num_streams > 1)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Box<dyn ReadSeek>>, FormatError> {

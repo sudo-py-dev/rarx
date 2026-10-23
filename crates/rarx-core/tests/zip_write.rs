@@ -410,7 +410,7 @@ fn unsupported_targets_and_missing_inputs() {
     let tmp = TempDir::new("write-errors");
     let src = make_tree(tmp.path());
     let err = add(
-        &tmp.path().join("x.7z"),
+        &tmp.path().join("x.rar"),
         &[src],
         &AddOptions::default(),
         &mut SilentUpdate,

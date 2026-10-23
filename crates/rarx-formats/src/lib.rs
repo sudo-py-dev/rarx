@@ -8,6 +8,7 @@
 
 mod entry;
 mod error;
+mod new_item;
 mod reader;
 pub mod sevenz;
 mod signature;
@@ -16,5 +17,6 @@ pub mod zip;
 
 pub use entry::{CivilTime, Entry, EntryKind, FileTime};
 pub use error::{DataError, FormatError};
+pub use new_item::NewItem;
 pub use reader::{ArchiveReader, ReadSeek, open};
 pub use signature::{FormatId, Signature, detect};

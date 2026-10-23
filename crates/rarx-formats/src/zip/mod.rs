@@ -17,7 +17,8 @@ use rarx_io::Cursor;
 use crate::verify::VerifyReader;
 use crate::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, ReadSeek};
 
-pub use writer::{NewItem, ZipMethod, ZipWriter};
+pub use crate::NewItem;
+pub use writer::{ZipMethod, ZipWriter};
 
 const LOCAL_SIG: u32 = 0x0403_4B50;
 const CENTRAL_SIG: u32 = 0x0201_4B50;

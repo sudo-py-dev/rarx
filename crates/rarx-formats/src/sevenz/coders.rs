@@ -217,7 +217,7 @@ fn decoder(coder: &Coder, mut inputs: Vec<Stream>, size: u64) -> Result<Stream, 
 }
 
 /// Dictionary size encoded in the LZMA2 property byte.
-fn lzma2_dictionary(code: u8) -> Option<u64> {
+pub(super) fn lzma2_dictionary(code: u8) -> Option<u64> {
     match code {
         0..=39 => Some((2 | u64::from(code & 1)) << (code / 2 + 11)),
         40 => Some(u64::from(u32::MAX)),

@@ -268,6 +268,8 @@ fn run_add(path: &Path, options: &Options, mode: UpdateMode, move_files: bool) -
         exclude: options.excludes.clone(),
         store_symlinks: options.store_symlinks,
         delete_sources: options.delete_sources || move_files,
+        solid: true,
+        compress_header: true,
         force_zip64: false,
     };
     let mut console = UpdateConsole { quiet };

@@ -85,14 +85,12 @@ fn rx7_adds_updates_and_deletes() {
     assert_eq!(code(&run(RX7, &["d", arg(&zip), "*.log"], "")), Some(0));
     assert!(!stdout(&run(RX7, &["l", arg(&zip)], "")).contains("b.log"));
 
-    assert_eq!(
-        code(&run(
-            RX7,
-            &["a", "-t7z", arg(&tmp.path().join("x.7z")), arg(&src)],
-            ""
-        )),
-        Some(2)
+    let rar = run(
+        RX7,
+        &["a", "-trar", arg(&tmp.path().join("x.rar")), arg(&src)],
+        "",
     );
+    assert_eq!(code(&rar), Some(2));
     let missing = run(RX7, &["a", arg(&zip), arg(&tmp.path().join("nope"))], "");
     assert_eq!(code(&missing), Some(1));
 }
@@ -266,9 +264,44 @@ fn reads_7z_archives() {
     );
     let printed = run(RARX, &["p", "-inul", arg(&archive), "naïve*"], "");
     assert_eq!(stdout(&printed), "unicode name\n");
+}
+
+#[test]
+fn rx7_creates_7z_archives() {
+    let tmp = TempDir::new("rx7-7z");
+    let src = sample_tree(tmp.path());
+    // No extension: 7-Zip appends `.7z`.
+    let base = tmp.path().join("packed");
+    let created = run(RX7, &["a", arg(&base), arg(&src), "-mx9"], "");
     assert_eq!(
-        code(&run(RX7, &["a", arg(&archive), "x"], "")),
-        Some(2),
-        "7z writing is not available yet"
+        code(&created),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
     );
+    let archive = tmp.path().join("packed.7z");
+    let listing = stdout(&run(RX7, &["l", "-slt", arg(&archive)], ""));
+    assert!(
+        listing.contains("Type = 7z") && listing.contains("Method = LZMA2"),
+        "{listing}"
+    );
+    assert_eq!(code(&run(RX7, &["t", arg(&archive)], "")), Some(0));
+
+    let flat = tmp.path().join("flat.7z");
+    let args = ["a", "-ms=off", "-mhc=off", "-mx0", arg(&flat), arg(&src)];
+    assert_eq!(code(&run(RX7, &args, "")), Some(0));
+    assert!(stdout(&run(RX7, &["l", "-slt", arg(&flat)], "")).contains("Method = Copy"));
+
+    assert_eq!(code(&run(RX7, &["d", arg(&archive), "*.log"], "")), Some(0));
+    assert!(!stdout(&run(RX7, &["l", arg(&archive)], "")).contains("b.log"));
+    let out = format!("-o{}", tmp.path().join("out").display());
+    assert_eq!(code(&run(RX7, &["x", arg(&archive), &out], "")), Some(0));
+    let a = std::fs::read_to_string(tmp.path().join("out/src/a.txt")).unwrap();
+    assert_eq!(a, "alpha\n".repeat(50));
+    let mismatch = run(
+        RX7,
+        &["a", "-t7z", arg(&tmp.path().join("x.zip")), arg(&src)],
+        "",
+    );
+    assert_eq!(code(&mismatch), Some(2));
 }

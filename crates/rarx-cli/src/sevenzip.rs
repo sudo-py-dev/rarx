@@ -33,14 +33,15 @@ Usage: rx7 <command> [<switches>...] <archive_name> [<file_names>...]
   -- : Stop switches parsing
   -ao{a|s|t|u} : set Overwrite mode
   -i!{wildcard} : Include filenames
-  -m{Parameters} : set compression Method (-mx[0-9], -mm=Copy|Deflate)
+  -m{Parameters} : set compression Method (-mx[0-9], -mm=Copy|Deflate|LZMA2,
+                   -ms=on|off solid, -mhc=on|off header compression)
   -o{Directory} : set Output directory
   -r[-] : Recurse subdirectories (accepted; masks always match at any depth)
   -sdel : delete files after compression
   -slt : show technical information for l (List) command
   -snl : store symbolic links as links
   -so : write data to stdout
-  -t{Type} : Set type of archive (only zip can be created yet)
+  -t{Type} : Set type of archive (7z or zip for creation)
   -x!{wildcard} : eXclude filenames
   -y : assume Yes on all queries";
 
@@ -55,7 +56,10 @@ struct Options {
     to_stdout: bool,
     selection: Selection,
     excludes: Selection,
-    level: u32,
+    /// `-mx` level as given (0–9).
+    mx: u32,
+    solid: bool,
+    compress_header: bool,
     store_symlinks: bool,
     delete_sources: bool,
     archive_type: Option<String>,
@@ -110,7 +114,9 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
         to_stdout: false,
         selection: Selection::all(),
         excludes: Selection::all(),
-        level: 6,
+        mx: 5,
+        solid: true,
+        compress_header: true,
         store_symlinks: false,
         delete_sources: false,
         archive_type: None,
@@ -121,10 +127,14 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
             "y" => options.assume_yes = true,
             "slt" => options.technical = true,
             "so" => options.to_stdout = true,
-            "r" | "r-" | "r0" | "bd" | "mm=deflate" | "m0=deflate" => {}
+            "r" | "r-" | "r0" | "bd" | "mm=deflate" | "m0=deflate" | "mm=lzma2" | "m0=lzma2" => {}
+            "ms" | "ms=on" => options.solid = true,
+            "ms=off" => options.solid = false,
+            "mhc" | "mhc=on" => options.compress_header = true,
+            "mhc=off" => options.compress_header = false,
             "sdel" => options.delete_sources = true,
             "snl" => options.store_symlinks = true,
-            "mm=copy" | "m0=copy" => options.level = 0,
+            "mm=copy" | "m0=copy" => options.mx = 0,
             _ if lower.starts_with("mx") => {
                 let digits = lower[2..].trim_start_matches('=');
                 let mx: u32 = if digits.is_empty() {
@@ -134,7 +144,7 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
                         .parse()
                         .map_err(|_| format!("Unsupported switch: -{switch}"))?
                 };
-                options.level = deflate_level(mx);
+                options.mx = mx.min(9);
             }
             _ if lower.starts_with('m') => {
                 return Err(format!("Unsupported compression parameter: -{switch}"));
@@ -165,6 +175,30 @@ fn parse_switches(args: &Args) -> Result<Options, String> {
     Ok(options)
 }
 
+/// Resolves the archive to write: 7-Zip appends `.<type>` (default `.7z`) to names
+/// without an extension. Returns the path and whether it is a 7z archive.
+fn archive_target(path: &Path, archive_type: Option<&str>) -> Result<(PathBuf, bool), String> {
+    if let Some(other) = archive_type.filter(|t| !matches!(*t, "7z" | "zip")) {
+        return Err(format!("creating {other} archives is not supported yet"));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let Some(ext) = ext else {
+        let ty = archive_type.unwrap_or("7z");
+        let mut named = path.as_os_str().to_owned();
+        named.push(format!(".{ty}"));
+        return Ok((PathBuf::from(named), ty == "7z"));
+    };
+    let is_7z = ext == "7z";
+    match archive_type {
+        Some("7z") if !is_7z => Err(format!("-t7z does not match the .{ext} extension")),
+        Some("zip") if is_7z => Err("-tzip does not match the .7z extension".to_owned()),
+        _ => Ok((path.to_owned(), is_7z)),
+    }
+}
+
 /// Maps 7-Zip `-mx` levels (0–9) onto Deflate levels.
 fn deflate_level(mx: u32) -> u32 {
     match mx {
@@ -187,29 +221,38 @@ impl UpdateHandler for UpdateConsole {
 }
 
 fn run_add(path: &Path, inputs: &[String], options: &Options, mode: UpdateMode) -> ExitCode {
-    if let Some(kind) = options.archive_type.as_deref().filter(|t| *t != "zip") {
-        eprintln!("ERROR: creating {kind} archives is not supported yet");
-        return Exit::Fatal.into();
-    }
+    let (path, is_7z) = match archive_target(path, options.archive_type.as_deref()) {
+        Ok(target) => target,
+        Err(message) => {
+            eprintln!("ERROR: {message}");
+            return Exit::Fatal.into();
+        }
+    };
+    let path = path.as_path();
     let inputs: Vec<PathBuf> = if inputs.is_empty() {
         vec![PathBuf::from(".")]
     } else {
         inputs.iter().map(PathBuf::from).collect()
     };
-    let exists = path.exists();
-    println!(
-        "{} archive: {}
-",
-        if exists { "Updating" } else { "Creating" },
-        path.display()
-    );
+    let verb = if path.exists() {
+        "Updating"
+    } else {
+        "Creating"
+    };
+    println!("{verb} archive: {}\n", path.display());
     let add_options = AddOptions {
-        level: options.level,
+        level: if is_7z {
+            options.mx
+        } else {
+            deflate_level(options.mx)
+        },
         paths: StorePaths::Relative,
         mode,
         exclude: options.excludes.clone(),
         store_symlinks: options.store_symlinks,
         delete_sources: options.delete_sources,
+        solid: options.solid,
+        compress_header: options.compress_header,
         force_zip64: false,
     };
     match add(

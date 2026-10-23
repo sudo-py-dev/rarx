@@ -25,5 +25,8 @@ producers are used:
 | `s7r-aes.7z` | sevenz-rust2 | AES-256 with encrypted header (password `secret`) |
 | `s7r-ppmd.7z` | sevenz-rust2 | PPMd (unsupported for now) |
 
+`sevenz-verify.rs` is the `main.rs` of a second throwaway crate (same dependency) that
+extracts an archive with `sevenz-rust2`, used to check archives written by RarX.
+
 Still wanted: archives from real 7-Zip (BCJ2, ARM64, multi-volume, SFX, `-mhc=off`,
 `-mtc=on`, anti-items).

@@ -7,11 +7,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
-use std::io::{BufReader, BufWriter, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use rarx_formats::zip::{NewItem, ZipMethod, ZipReader, ZipWriter};
-use rarx_formats::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId};
+use rarx_formats::sevenz::{SevenZOptions, SevenZReader, SevenZWriter};
+use rarx_formats::zip::{ZipMethod, ZipReader, ZipWriter};
+use rarx_formats::{ArchiveReader, Entry, EntryKind, FileTime, FormatError, FormatId, NewItem};
 
 use crate::select::Selection;
 use crate::time::{from_system_time, to_local_civil, to_system_time};
@@ -43,6 +44,7 @@ pub enum UpdateMode {
 
 /// Settings for [`add`].
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // one flag per command-line switch
 pub struct AddOptions {
     /// Compression level: 0 stores, 1–9 trade speed for size.
     pub level: u32,
@@ -56,6 +58,10 @@ pub struct AddOptions {
     pub store_symlinks: bool,
     /// Delete source files once they are safely in the archive (`-sdel`, `-df`, `m`).
     pub delete_sources: bool,
+    /// 7z: one solid block for all files instead of one block per file (`-ms`).
+    pub solid: bool,
+    /// 7z: compress the header database (`-mhc`).
+    pub compress_header: bool,
     /// Always write ZIP64 records (testing aid).
     pub force_zip64: bool,
 }
@@ -69,6 +75,8 @@ impl Default for AddOptions {
             exclude: Selection::all(),
             store_symlinks: false,
             delete_sources: false,
+            solid: true,
+            compress_header: true,
             force_zip64: false,
         }
     }
@@ -142,11 +150,11 @@ pub fn add(
     handler: &mut dyn UpdateHandler,
     ctl: &JobControl,
 ) -> Result<UpdateReport> {
-    ensure_zip_target(archive_path)?;
+    let kind = target_kind(archive_path)?;
     let mut report = UpdateReport::default();
     let skip = [absolute(archive_path)];
     let sources = collect_sources(inputs, options, &skip, handler, &mut report);
-    let mut existing = open_existing(archive_path)?;
+    let mut existing = OldArchive::open(archive_path, kind)?;
 
     let replaces_old = |source: &Source, old: &Entry| match options.mode {
         UpdateMode::Add => true,
@@ -165,7 +173,7 @@ pub fn add(
     let mut used = vec![false; sources.len()];
     let mut archived = Vec::new();
 
-    let report = write_atomically(archive_path, options.force_zip64, |writer| {
+    let report = write_atomically(archive_path, kind, options, |writer| {
         if let Some(reader) = existing.as_mut() {
             let entries = reader.entries().to_vec();
             for (index, old) in entries.iter().enumerate() {
@@ -182,13 +190,13 @@ pub fn add(
                     Some(&i) => {
                         used[i] = true;
                         archived.push(i);
-                        keep(reader, index, writer, &old.name, &mut report, handler)?;
+                        keep(reader, index, writer, &mut report, handler)?;
                     }
                     None if options.mode == UpdateMode::Synchronize => {
                         report.deleted += 1;
                         handler.item_done(&old.name, ItemAction::Deleted);
                     }
-                    None => keep(reader, index, writer, &old.name, &mut report, handler)?,
+                    None => keep(reader, index, writer, &mut report, handler)?,
                 }
             }
         }
@@ -222,7 +230,8 @@ pub fn delete(
     handler: &mut dyn UpdateHandler,
     ctl: &JobControl,
 ) -> Result<UpdateReport> {
-    let Some(mut reader) = open_existing(archive_path)? else {
+    let kind = target_kind(archive_path)?;
+    let Some(mut reader) = OldArchive::open(archive_path, kind)? else {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("{} does not exist", archive_path.display()),
@@ -233,42 +242,138 @@ pub fn delete(
         return Ok(UpdateReport::default());
     }
     let mut report = UpdateReport::default();
-    write_atomically(archive_path, false, |writer| {
+    let options = reader.rewrite_options();
+    write_atomically(archive_path, kind, &options, |writer| {
         for (index, entry) in entries.iter().enumerate() {
             ctl.checkpoint()?;
             if selection.matches(&entry.name) {
                 report.deleted += 1;
                 handler.item_done(&entry.name, ItemAction::Deleted);
             } else {
-                keep(
-                    &mut reader,
-                    index,
-                    writer,
-                    &entry.name,
-                    &mut report,
-                    handler,
-                )?;
+                keep(&mut reader, index, writer, &mut report, handler)?;
             }
         }
         Ok(report)
     })
 }
 
-type TempWriter = ZipWriter<BufWriter<File>>;
+/// Archive formats RarX can write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Zip,
+    SevenZip,
+}
+
+/// The archive being updated.
+enum OldArchive {
+    Zip(ZipReader),
+    SevenZip(SevenZReader),
+}
+
+impl OldArchive {
+    fn open(path: &Path, kind: Kind) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let src = Box::new(BufReader::new(File::open(path)?));
+        Ok(Some(match kind {
+            Kind::Zip => Self::Zip(ZipReader::new(src)?),
+            Kind::SevenZip => Self::SevenZip(SevenZReader::new(src)?),
+        }))
+    }
+
+    fn entries(&self) -> &[Entry] {
+        match self {
+            Self::Zip(r) => r.entries(),
+            Self::SevenZip(r) => r.entries(),
+        }
+    }
+
+    /// Settings used when an archive is rewritten without new files (delete).
+    fn rewrite_options(&self) -> AddOptions {
+        let solid = match self {
+            Self::Zip(_) => true,
+            Self::SevenZip(r) => r.is_solid(),
+        };
+        AddOptions {
+            solid,
+            ..AddOptions::default()
+        }
+    }
+}
+
+/// The archive being written.
+enum NewArchive {
+    Zip(ZipWriter<BufWriter<File>>),
+    SevenZip(SevenZWriter<BufWriter<File>>),
+}
+
+impl NewArchive {
+    fn add_directory(&mut self, item: &NewItem) -> std::io::Result<()> {
+        match self {
+            Self::Zip(w) => w.add_directory(item),
+            Self::SevenZip(w) => w.add_directory(item),
+        }
+    }
+
+    fn add_symlink(&mut self, item: &NewItem, target: &str) -> std::io::Result<()> {
+        match self {
+            Self::Zip(w) => w.add_symlink(item, target),
+            Self::SevenZip(w) => w.add_symlink(item, target),
+        }
+    }
+
+    fn add_file(&mut self, item: &NewItem, level: u32, data: &mut dyn Read) -> std::io::Result<()> {
+        match self {
+            Self::Zip(w) => {
+                let method = match level {
+                    0 => ZipMethod::Store,
+                    level => ZipMethod::Deflate {
+                        level: level.min(9),
+                    },
+                };
+                w.add_file(item, method, data)
+            }
+            Self::SevenZip(w) => w.add_file(item, data),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<BufWriter<File>> {
+        match self {
+            Self::Zip(w) => w.finish(None),
+            Self::SevenZip(w) => w.finish(),
+        }
+    }
+}
 
 /// Writes a new archive into a temporary file and renames it over `target`.
 fn write_atomically(
     target: &Path,
-    force_zip64: bool,
-    body: impl FnOnce(&mut TempWriter) -> Result<UpdateReport>,
+    kind: Kind,
+    options: &AddOptions,
+    body: impl FnOnce(&mut NewArchive) -> Result<UpdateReport>,
 ) -> Result<UpdateReport> {
     let temp = temp_path(target);
     let result = (|| {
         let file = File::options().write(true).create_new(true).open(&temp)?;
-        let mut writer = ZipWriter::new(BufWriter::new(file));
-        writer.set_force_zip64(force_zip64);
+        let out = BufWriter::new(file);
+        let mut writer = match kind {
+            Kind::Zip => {
+                let mut zip = ZipWriter::new(out);
+                zip.set_force_zip64(options.force_zip64);
+                NewArchive::Zip(zip)
+            }
+            Kind::SevenZip => {
+                let settings = SevenZOptions {
+                    level: options.level,
+                    solid: options.solid,
+                    compress_header: options.compress_header,
+                };
+                NewArchive::SevenZip(SevenZWriter::new(out, settings)?)
+            }
+        };
         let mut report = body(&mut writer)?;
-        let mut out = writer.finish(None)?;
+        let mut out = writer.finish()?;
         out.flush()?;
         out.into_inner()
             .map_err(std::io::IntoInnerError::into_error)?
@@ -288,11 +393,16 @@ fn temp_path(target: &Path) -> PathBuf {
     target.with_file_name(format!(".{name}.rarx-{}.tmp", std::process::id()))
 }
 
-fn ensure_zip_target(archive_path: &Path) -> Result<()> {
+/// Which format to write: that of the existing archive, else from the extension.
+fn target_kind(archive_path: &Path) -> Result<Kind> {
     if archive_path.exists() {
         return match crate::detect_file(archive_path)? {
-            Some(FormatId::Zip) => Ok(()),
-            Some(other) => Err(Error::Unsupported(format!("updating {other:?} archives"))),
+            Some(FormatId::Zip) => Ok(Kind::Zip),
+            Some(FormatId::SevenZip) => Ok(Kind::SevenZip),
+            Some(other) => Err(Error::Unsupported(format!(
+                "updating {} archives",
+                other.name()
+            ))),
             None => Err(Error::UnknownFormat(archive_path.to_owned())),
         };
     }
@@ -301,39 +411,55 @@ fn ensure_zip_target(archive_path: &Path) -> Result<()> {
         .and_then(|e| e.to_str())
         .unwrap_or_default();
     match ext.to_ascii_lowercase().as_str() {
-        "zip" | "jar" | "zipx" | "apk" | "epub" | "xpi" | "cbz" => Ok(()),
+        "zip" | "jar" | "zipx" | "apk" | "epub" | "xpi" | "cbz" => Ok(Kind::Zip),
+        "7z" => Ok(Kind::SevenZip),
         "" => Err(Error::Unsupported(
-            "archives without an extension; add .zip".to_owned(),
+            "archives without an extension; add .zip or .7z".to_owned(),
         )),
         other => Err(Error::Unsupported(format!("creating .{other} archives"))),
     }
 }
 
-fn open_existing(path: &Path) -> Result<Option<ZipReader>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let src = Box::new(BufReader::new(File::open(path)?));
-    Ok(Some(ZipReader::new(src)?))
-}
-
+/// Carries an existing item over into the new archive: ZIP items are copied byte
+/// for byte; 7z items are decoded and re-encoded, because they share solid blocks.
 fn keep(
-    reader: &mut ZipReader,
+    reader: &mut OldArchive,
     index: usize,
-    writer: &mut TempWriter,
-    name: &str,
+    writer: &mut NewArchive,
     report: &mut UpdateReport,
     handler: &mut dyn UpdateHandler,
 ) -> Result<()> {
-    reader.copy_raw(index, writer)?;
+    let entry = reader.entries()[index].clone();
+    match (reader, writer) {
+        (OldArchive::Zip(r), NewArchive::Zip(w)) => r.copy_raw(index, w)?,
+        (OldArchive::SevenZip(r), writer) => {
+            let mut item = NewItem::new(entry.name.clone(), entry.kind);
+            item.modified = entry.modified;
+            item.unix_mode = entry.unix_mode.map(|m| m & 0o7777);
+            item.dos_attributes = entry.dos_attributes;
+            item.size_hint = entry.size;
+            match entry.kind {
+                EntryKind::Directory => writer.add_directory(&item)?,
+                EntryKind::Symlink => {
+                    let mut target = String::new();
+                    r.open_entry(index)?.read_to_string(&mut target)?;
+                    writer.add_symlink(&item, &target)?;
+                }
+                EntryKind::File => writer.add_file(&item, 0, &mut r.open_entry(index)?)?,
+            }
+        }
+        (OldArchive::Zip(_), NewArchive::SevenZip(_)) => {
+            return Err(Error::Unsupported("converting ZIP to 7z".to_owned()));
+        }
+    }
     report.kept += 1;
-    handler.item_done(name, ItemAction::Kept);
+    handler.item_done(&entry.name, ItemAction::Kept);
     Ok(())
 }
 
 /// Writes one disk source. Returns `false` (with a warning) if it could not be read.
-fn write_source<W: Write + Seek>(
-    writer: &mut ZipWriter<W>,
+fn write_source(
+    writer: &mut NewArchive,
     source: &Source,
     options: &AddOptions,
     report: &mut UpdateReport,
@@ -363,18 +489,12 @@ fn write_source<W: Write + Seek>(
                 Ok(file) => file,
                 Err(err) => return warn(err.to_string(), report),
             };
-            let method = match options.level {
-                0 => ZipMethod::Store,
-                level => ZipMethod::Deflate {
-                    level: level.min(9),
-                },
-            };
             let mut counted = CountingReader {
                 inner: BufReader::new(file),
                 count: 0,
             };
             writer
-                .add_file(&item, method, &mut counted)
+                .add_file(&item, options.level, &mut counted)
                 .map_err(|err| {
                     Error::Format(FormatError::Io(std::io::Error::new(
                         err.kind(),
