@@ -89,19 +89,24 @@ fn sanitize_component(component: &str, rules: NameRules) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
+    /// Joins components with `/` so expectations are the same on every platform.
+    fn joined(path: &Path) -> String {
+        path.iter()
+            .map(|c| c.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     fn unix(name: &str) -> Option<String> {
-        sanitize_path(name, NameRules::Unix).map(|p| p.to_string_lossy().into_owned())
+        sanitize_path(name, NameRules::Unix).map(|p| joined(&p))
     }
 
     fn win(name: &str) -> Option<String> {
-        sanitize_path(name, NameRules::Windows).map(|p| {
-            p.iter()
-                .map(|c| c.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/")
-        })
+        sanitize_path(name, NameRules::Windows).map(|p| joined(&p))
     }
 
     #[test]

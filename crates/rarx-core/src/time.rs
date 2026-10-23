@@ -65,15 +65,16 @@ pub fn to_local_civil(time: SystemTime) -> Option<CivilTime> {
 mod tests {
     use super::*;
 
+    // Sub-second values are multiples of 100 ns, the resolution of Windows file times.
     #[test]
     fn unix_time_round_trips() {
         let t = to_system_time(FileTime::Unix {
             seconds: 1_000,
-            nanos: 5,
+            nanos: 500,
         })
         .unwrap();
         let since = t.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-        assert_eq!((since.as_secs(), since.subsec_nanos()), (1_000, 5));
+        assert_eq!((since.as_secs(), since.subsec_nanos()), (1_000, 500));
     }
 
     #[test]
@@ -92,18 +93,18 @@ mod tests {
 
     #[test]
     fn system_time_conversions_agree() {
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_767_323_045, 7);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_767_323_045, 700);
         assert_eq!(
             from_system_time(now),
             Some(FileTime::Unix {
                 seconds: 1_767_323_045,
-                nanos: 7
+                nanos: 700
             })
         );
         let civil = to_local_civil(now).unwrap();
         assert_eq!(
             to_system_time(FileTime::Local(civil)),
-            Some(now - std::time::Duration::new(0, 7))
+            Some(now - std::time::Duration::new(0, 700))
         );
     }
 }
