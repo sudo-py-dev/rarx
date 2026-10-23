@@ -30,6 +30,11 @@ fn run(bin: &str, args: &[&str], stdin: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// The CLIs print archive paths with the platform separator, like the reference tools.
+fn native(text: &str) -> String {
+    text.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 fn code(output: &Output) -> Option<i32> {
     output.status.code()
 }
@@ -77,7 +82,7 @@ fn rx7_adds_updates_and_deletes() {
         String::from_utf8_lossy(&added.stderr)
     );
     let listing = stdout(&run(RX7, &["l", arg(&zip)], ""));
-    assert!(listing.contains("src/a.txt") && !listing.contains("b.log"));
+    assert!(listing.contains(&native("src/a.txt")) && !listing.contains("b.log"));
     assert_eq!(code(&run(RX7, &["t", arg(&zip)], "")), Some(0));
 
     assert_eq!(code(&run(RX7, &["u", arg(&zip), arg(&src)], "")), Some(0));
@@ -107,7 +112,7 @@ fn rarx_adds_moves_and_deletes() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
-    assert!(stdout(&added).contains("Adding      src/a.txt"));
+    assert!(stdout(&added).contains(&native("Adding      src/a.txt")));
 
     assert_eq!(
         code(&run(
@@ -162,7 +167,7 @@ fn rx7_technical_listing_and_stdout() {
         &["l", "-slt", arg(&zip("infozip-basic.zip")), "a.txt"],
         "",
     ));
-    assert!(listing.contains("Path = dir/a.txt"));
+    assert!(listing.contains(&native("Path = dir/a.txt")));
     assert!(listing.contains("Method = Deflate"));
     assert!(!listing.contains("Path = b.bin"));
 
@@ -252,7 +257,7 @@ fn rarx_bare_listing_and_print() {
 fn reads_7z_archives() {
     let archive = corpus_file("7z/lzma2-solid.7z");
     let listing = stdout(&run(RX7, &["l", arg(&archive)], ""));
-    assert!(listing.contains("Type = 7z") && listing.contains("docs/a.txt"));
+    assert!(listing.contains("Type = 7z") && listing.contains(&native("docs/a.txt")));
     assert_eq!(code(&run(RX7, &["t", arg(&archive)], "")), Some(0));
     assert_eq!(
         code(&run(

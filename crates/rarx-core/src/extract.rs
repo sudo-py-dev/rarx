@@ -587,10 +587,31 @@ fn create_symlink(target: &str, path: &Path) -> std::result::Result<(), ItemErro
     std::os::unix::fs::symlink(target, path).map_err(|err| ItemError::Io(err.to_string()))
 }
 
+/// Creates a native link where possible; without the privilege to create links
+/// (common on Windows), stores a copy of the already-extracted target instead.
 #[cfg(not(unix))]
-fn create_symlink(_target: &str, _path: &Path) -> std::result::Result<(), ItemError> {
+fn create_symlink(target: &str, path: &Path) -> std::result::Result<(), ItemError> {
+    let native = target.replace('/', "\\");
+    let resolved = path.parent().unwrap_or(Path::new("")).join(&native);
+    #[cfg(windows)]
+    {
+        let made = if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(&native, path)
+        } else {
+            std::os::windows::fs::symlink_file(&native, path)
+        };
+        if made.is_ok() {
+            return Ok(());
+        }
+    }
+    if resolved.is_file() {
+        return fs::copy(&resolved, path)
+            .map(|_| ())
+            .map_err(|err| ItemError::Io(err.to_string()));
+    }
     Err(ItemError::Unsupported(
-        "symbolic links on this platform".to_owned(),
+        "symbolic link: links cannot be created here and the target is not an extracted file"
+            .to_owned(),
     ))
 }
 

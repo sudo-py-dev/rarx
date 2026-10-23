@@ -553,6 +553,7 @@ fn unix_mode(_meta: &Metadata) -> Option<u32> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)] // `None`-capable on other platforms
 fn dos_attributes(meta: &Metadata) -> Option<u32> {
     use std::os::windows::fs::MetadataExt;
     Some(meta.file_attributes() & 0xFFFF)

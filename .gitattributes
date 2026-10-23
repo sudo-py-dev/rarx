@@ -1,0 +1,3 @@
+# Test fixtures are byte-exact archives; never convert line endings.
+corpus/** -text
+*.rs text eol=lf

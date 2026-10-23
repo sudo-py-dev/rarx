@@ -247,10 +247,16 @@ fn path_modes() {
             ..AddOptions::default()
         },
     );
-    let expected = format!(
-        "{}/docs/a.txt",
-        src.to_str().unwrap().trim_start_matches('/')
-    );
+    // Roots and drive letters are dropped; the rest of the path is kept.
+    let mut parts: Vec<String> = src
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    parts.extend(["docs".to_owned(), "a.txt".to_owned()]);
+    let expected = parts.join("/");
     assert!(names(&given).contains(&expected), "{:?}", names(&given));
 }
 
